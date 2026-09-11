@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+salidas/
+
+# Artefactos temporales de construcción y validación del storyboard
+.codex-finalizer-*/
+.storyboard-build-*/
