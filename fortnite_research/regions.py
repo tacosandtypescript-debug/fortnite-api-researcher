@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .transport import write_text_atomic
+
 
 REGION_ENDPOINTS = (
     ("NA-East", "ping-nae.ds.on.epicgames.com"),
@@ -115,5 +117,5 @@ def save_region_report(document: dict[str, Any], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc)
     path = output_dir / f"{timestamp.strftime('%Y%m%dT%H%M%SZ')}-servidores-fortnite-na.json"
-    path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
     return path

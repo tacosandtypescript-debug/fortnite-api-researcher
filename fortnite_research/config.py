@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+from .transport import validate_https_url
 
 
 def _read_dotenv(path: Path) -> dict[str, str]:
@@ -16,6 +19,8 @@ def _read_dotenv(path: Path) -> dict[str, str]:
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
@@ -31,6 +36,52 @@ def _env(name: str, dotenv: dict[str, str], default: str = "") -> str:
     return dotenv.get(name, default)
 
 
+def _project_root(root: Path | None) -> Path:
+    if root is not None:
+        return root.resolve()
+    current = Path.cwd().resolve()
+    candidates = [current, *current.parents, Path(__file__).resolve().parents[1]]
+    for candidate in candidates:
+        if (candidate / "pyproject.toml").is_file():
+            return candidate
+    return current
+
+
+def _parse_hosts(value: str) -> tuple[str, ...]:
+    hosts = tuple(
+        item.strip().casefold()
+        for item in value.split(",")
+        if item.strip()
+    )
+    if not hosts:
+        raise ValueError("FORTNITE_API_TRUSTED_HOSTS no puede estar vacío")
+    for host in hosts:
+        if "/" in host or ":" in host or "://" in host:
+            raise ValueError(
+                "FORTNITE_API_TRUSTED_HOSTS debe contener solo hostnames separados por comas"
+            )
+    return tuple(dict.fromkeys(hosts))
+
+
+def _parse_bool(name: str, value: str) -> bool:
+    normalized = value.strip().casefold()
+    if normalized in {"1", "true", "yes", "si", "sí", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} debe ser true/false")
+
+
+def _parse_positive_float(name: str, value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} debe ser numérico") from exc
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise ValueError(f"{name} debe ser mayor que cero")
+    return parsed
+
+
 @dataclass(frozen=True)
 class Settings:
     api_base_url: str
@@ -40,29 +91,82 @@ class Settings:
     telegram_chat_id: str | None
     auto_send_telegram: bool
     output_dir: Path
+    api_trusted_hosts: tuple[str, ...] = ("fortnite-api.com", "www.fortnite-api.com")
+    telegram_allow_chat_discovery: bool = False
+    penny_api_base_url: str = "https://pennydb.net"
+    penny_poll_interval: float = 600.0
+    new_content_max_age_hours: float = 24.0
 
     @classmethod
     def load(cls, root: Path | None = None) -> "Settings":
-        project_root = (root or Path.cwd()).resolve()
+        project_root = _project_root(root)
         dotenv = _read_dotenv(project_root / ".env")
         api_key = _env("FORTNITE_API_KEY", dotenv).strip() or None
         bot_token = _env("TELEGRAM_BOT_TOKEN", dotenv).strip() or None
         chat_id = _env("TELEGRAM_CHAT_ID", dotenv).strip() or None
-        timeout_text = _env("FORTNITE_API_TIMEOUT", dotenv, "30").strip()
-        try:
-            timeout = float(timeout_text)
-        except ValueError as exc:
-            raise ValueError("FORTNITE_API_TIMEOUT debe ser numérico") from exc
-        if timeout <= 0:
-            raise ValueError("FORTNITE_API_TIMEOUT debe ser mayor que cero")
-        auto_send = _env("AUTO_SEND_TELEGRAM", dotenv, "false").strip().lower()
+        timeout = _parse_positive_float(
+            "FORTNITE_API_TIMEOUT",
+            _env("FORTNITE_API_TIMEOUT", dotenv, "30").strip(),
+        )
+        api_base_url = _env(
+            "FORTNITE_API_BASE_URL",
+            dotenv,
+            "https://fortnite-api.com",
+        ).strip().rstrip("/")
+        api_host = validate_https_url(api_base_url)
+        trusted_hosts = _parse_hosts(
+            _env(
+                "FORTNITE_API_TRUSTED_HOSTS",
+                dotenv,
+                "fortnite-api.com,www.fortnite-api.com",
+            )
+        )
+        if api_key and api_host not in trusted_hosts:
+            raise ValueError(
+                "La API key solo se enviará a un hostname incluido en "
+                "FORTNITE_API_TRUSTED_HOSTS"
+            )
+        auto_send = _parse_bool(
+            "AUTO_SEND_TELEGRAM",
+            _env("AUTO_SEND_TELEGRAM", dotenv, "false"),
+        )
+        allow_chat_discovery = _parse_bool(
+            "TELEGRAM_ALLOW_CHAT_DISCOVERY",
+            _env("TELEGRAM_ALLOW_CHAT_DISCOVERY", dotenv, "false"),
+        )
+        penny_api_base_url = _env(
+            "PENNY_API_BASE_URL",
+            dotenv,
+            "https://pennydb.net",
+        ).strip().rstrip("/")
+        validate_https_url(
+            penny_api_base_url,
+            allowed_hosts={"pennydb.net", "beta.pennydb.net"},
+        )
+        penny_poll_interval = _parse_positive_float(
+            "PENNY_POLL_INTERVAL_SECONDS",
+            _env("PENNY_POLL_INTERVAL_SECONDS", dotenv, "600").strip(),
+        )
+        new_content_max_age_hours = _parse_positive_float(
+            "PENNY_NEW_CONTENT_MAX_AGE_HOURS",
+            _env("PENNY_NEW_CONTENT_MAX_AGE_HOURS", dotenv, "24").strip(),
+        )
+        output_text = _env("FORTNITE_OUTPUT_DIR", dotenv, "salidas").strip()
+        output_dir = Path(output_text or "salidas")
+        if not output_dir.is_absolute():
+            output_dir = project_root / output_dir
         return cls(
-            api_base_url=_env("FORTNITE_API_BASE_URL", dotenv, "https://fortnite-api.com").rstrip("/"),
+            api_base_url=api_base_url,
             api_key=api_key,
             api_timeout=timeout,
             telegram_bot_token=bot_token,
             telegram_chat_id=chat_id,
-            auto_send_telegram=auto_send in {"1", "true", "yes", "si", "sí"},
-            output_dir=project_root / "salidas",
+            auto_send_telegram=auto_send,
+            output_dir=output_dir,
+            api_trusted_hosts=trusted_hosts,
+            telegram_allow_chat_discovery=allow_chat_discovery,
+            penny_api_base_url=penny_api_base_url,
+            penny_poll_interval=penny_poll_interval,
+            new_content_max_age_hours=new_content_max_age_hours,
         )
 

@@ -19,11 +19,10 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from .client import FortniteAPIClient
 from .stw import build_stw_report
+from .transport import HTTPFetchError, fetch, write_text_atomic
 
 
 EPIC_STW_WORLD_INFO = (
@@ -63,46 +62,40 @@ def _decode_json(body: bytes) -> Any | None:
 
 def _http_probe(url: str, timeout: float, accept: str) -> dict[str, Any]:
     """Obtiene una respuesta pública sin incluir cookies ni credenciales."""
-    request = Request(
-        url,
-        headers={
-            "Accept": accept,
-            "User-Agent": "fortnite-api-researcher/0.1.0 (public-source-audit)",
-        },
-        method="GET",
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            body = response.read()
-            return {
-                "url": url,
-                "method": "GET",
-                "httpStatus": int(response.status),
-                "contentType": response.headers.get("Content-Type", ""),
-                "bodyBytes": len(body),
-                "body": body,
-                "transportError": None,
-            }
-    except HTTPError as exc:
-        body = exc.read()
+        response = fetch(
+            url,
+            headers={
+                "Accept": accept,
+                "User-Agent": "fortnite-api-researcher/0.1.0 (public-source-audit)",
+            },
+            timeout=timeout,
+            max_bytes=12_000_000,
+            retries=2,
+        )
         return {
             "url": url,
             "method": "GET",
-            "httpStatus": int(exc.code),
-            "contentType": exc.headers.get("Content-Type", "") if exc.headers else "",
-            "bodyBytes": len(body),
-            "body": body,
+            "httpStatus": response.status_code,
+            "contentType": response.headers.get("Content-Type", ""),
+            "bodyBytes": len(response.body),
+            "body": response.body,
             "transportError": None,
         }
-    except (URLError, TimeoutError, OSError) as exc:
+    except HTTPFetchError as exc:
+        content_type = (
+            exc.headers.get("Content-Type", "")
+            if exc.headers is not None
+            else ""
+        )
         return {
             "url": url,
             "method": "GET",
-            "httpStatus": None,
-            "contentType": "",
-            "bodyBytes": 0,
-            "body": b"",
-            "transportError": str(getattr(exc, "reason", exc)),
+            "httpStatus": exc.status_code,
+            "contentType": content_type,
+            "bodyBytes": len(exc.body),
+            "body": exc.body,
+            "transportError": None if exc.status_code is not None else str(exc),
         }
 
 
@@ -113,7 +106,11 @@ def probe_json_endpoint(url: str, timeout: float = 30) -> dict[str, Any]:
     payload = _decode_json(body)
     result["json"] = payload
     result["jsonValid"] = payload is not None
-    result["available"] = result["httpStatus"] == 200 and payload is not None
+    result["available"] = (
+        isinstance(result["httpStatus"], int)
+        and 200 <= result["httpStatus"] < 300
+        and payload is not None
+    )
     return result
 
 
@@ -123,7 +120,11 @@ def probe_html_page(url: str, timeout: float = 30) -> dict[str, Any]:
     body = result.pop("body")
     result["html"] = body.decode("utf-8", errors="replace")
     result["title"] = _extract_title(result["html"])
-    result["available"] = result["httpStatus"] == 200 and bool(result["html"])
+    result["available"] = (
+        isinstance(result["httpStatus"], int)
+        and 200 <= result["httpStatus"] < 300
+        and bool(result["html"])
+    )
     return result
 
 
@@ -398,6 +399,56 @@ def build_deep_stw_report(
     )
 
     compact_api = _endpoint_summary(stw_report)
+    checks_by_path = {
+        str(item.get("path")): item
+        for item in compact_api.get("checks", [])
+        if item.get("path")
+    }
+
+    def api_status(path: str) -> str:
+        return _status_line(checks_by_path.get(path, {}))
+
+    candidate_paths = (
+        "/v2/missions",
+        "/v2/alerts",
+        "/v2/stw/missions",
+        "/v2/stw/alerts",
+    )
+    candidate_statuses = "; ".join(
+        f"{path}: {api_status(path)}" for path in candidate_paths
+    )
+    free_status = _status_line(free_probe)
+    planner_status = _status_line(planner_probe)
+    epic_statuses = "; ".join(
+        f"{probe.get('url')}: {_status_line(probe)}" for probe in epic_probes
+    )
+    free_expiration = free_data.get("expirationDates") or []
+    planner_expiration = planner_data.get("dataTimeExpires")
+    observed_values = [
+        f"{current_vbucks.get('vbucks')} V-Bucks"
+        if current_vbucks.get("vbucks") is not None
+        else None,
+        f"PL {current_vbucks.get('powerLevel')}"
+        if current_vbucks.get("powerLevel") is not None
+        else None,
+        str(current_vbucks.get("type"))
+        if current_vbucks.get("type")
+        else None,
+        str(current_vbucks.get("zone"))
+        if current_vbucks.get("zone")
+        else None,
+    ]
+    observed_text = ", ".join(value for value in observed_values if value) or "datos incompletos"
+    expiration_text = ", ".join(
+        str(value)
+        for value in [*free_expiration, planner_expiration]
+        if value
+    ) or "no indicada"
+    agreement_text = (
+        "Las dos fuentes coincidieron en la observación."
+        if agreement
+        else "Las fuentes no coincidieron completamente o no aportaron datos suficientes para compararlas."
+    )
     full_stw_messages = compact_api["stwFeed"]["messages"]
     if full_stw_messages:
         first_message = full_stw_messages[0]
@@ -414,26 +465,26 @@ def build_deep_stw_report(
 
 ## Resultado ejecutivo
 
-1. **Fortnite-API.com sí entrega noticias de STW**, mediante [`/v2/news/stw`]({FORTNITE_API_NEWS_DOCS}) y también dentro de [`/v2/news`]({FORTNITE_API_NEWS_DOCS}). En la consulta de este expediente ambas rutas respondieron HTTP 200.
-2. **Fortnite-API.com no mostró una ruta pública documentada para misiones o alertas de pavos.** Se probaron `/v2/missions`, `/v2/alerts`, `/v2/stw/missions` y `/v2/stw/alerts`; en esta ejecución las cuatro respondieron HTTP 404. [`/v2/shop`]({FORTNITE_API_SHOP_DOCS}) respondió, pero es la tienda general y no un feed de alertas de misiones.
-3. **Sí existe un endpoint de datos de STW en los servicios de Epic:** `GET {EPIC_STW_WORLD_INFO}`. La documentación comunitaria de endpoints de Epic lo asocia con `theaters`, `missions` y `missionAlerts` ([referencia técnica]({EPIC_STW_ENDPOINT_DOCS})). La prueba anónima actual devolvió HTTP 401 (`authentication_failed`), por lo que requiere un token/sesión de Epic; la API key de Fortnite-API.com no sustituye esa autenticación.
-4. **Los rastreadores públicos muestran las alertas como páginas HTML server-rendered**, no como una API JSON pública que haya podido confirmar: Free the V-Bucks y Fortnite STW Planner fueron consultados; sus páginas exponen el dato visible y una hora de expiración. Free the V-Bucks indica además que el acceso a sus servicios de API se solicita al propietario ([página About]({FREETHEVBUCKS_ABOUT})).
+1. **Fortnite-API.com entrega noticias de STW** mediante [`/v2/news/stw`]({FORTNITE_API_NEWS_DOCS}) y también dentro de [`/v2/news`]({FORTNITE_API_NEWS_DOCS}). Estados observados: `{api_status('/v2/news/stw')}` y `{api_status('/v2/news')}`.
+2. **Fortnite-API.com no mostró una ruta pública documentada para misiones o alertas de pavos.** Estados de las rutas candidatas: `{candidate_statuses}`. [`/v2/shop`]({FORTNITE_API_SHOP_DOCS}) respondió `{api_status('/v2/shop')}`, pero es la tienda general y no un feed de alertas de misiones.
+3. **El endpoint de datos de STW en los servicios de Epic fue comprobado con estos estados:** `{epic_statuses}`. La documentación comunitaria de endpoints de Epic lo asocia con `theaters`, `missions` y `missionAlerts` ([referencia técnica]({EPIC_STW_ENDPOINT_DOCS})); un estado 401 indica que la consulta anónima requiere autenticación y que la API key de Fortnite-API.com no la sustituye.
+4. **Los rastreadores públicos muestran las alertas como páginas HTML server-rendered**, no como una API JSON pública que haya podido confirmar: Free the V-Bucks respondió `{free_status}` y Fortnite STW Planner `{planner_status}`. Free the V-Bucks indica además que el acceso a sus servicios de API se solicita al propietario ([página About]({FREETHEVBUCKS_ABOUT})).
 
 ## Matriz de endpoints y fuentes
 
 | Fuente/ruta | Método | Autenticación | Qué contiene | Estado comprobado |
 |---|---:|---|---|---|
-| `https://fortnite-api.com/v2/news/stw` | GET | API key configurada en el proyecto | Mensajes/noticias de Salvar el Mundo | HTTP 200; {compact_api['stwFeed']['messageCount']} mensaje(s) |
-| `https://fortnite-api.com/v2/news` | GET | API key configurada en el proyecto | Feed combinado; incluye clave `stw` | HTTP 200 |
-| `https://fortnite-api.com/v2/shop` | GET | API key configurada en el proyecto | Tienda general | HTTP 200; {compact_api['shopEntryCount'] if compact_api['shopEntryCount'] is not None else 'conteo no disponible'} entradas según el expediente |
-| `https://fortnite-api.com/v2/missions` | GET | — | Ruta candidata no documentada | HTTP 404 |
-| `https://fortnite-api.com/v2/alerts` | GET | — | Ruta candidata no documentada | HTTP 404 |
-| `https://fortnite-api.com/v2/stw/missions` | GET | — | Ruta candidata no documentada | HTTP 404 |
-| `https://fortnite-api.com/v2/stw/alerts` | GET | — | Ruta candidata no documentada | HTTP 404 |
-| `{EPIC_STW_WORLD_INFO}` | GET | Token de Epic requerido | `theaters`, `missions`, `missionAlerts` | HTTP 401 sin autenticación |
-| `{HISTORICAL_EPIC_STW_WORLD_INFO}` | GET | Token de Epic requerido actualmente | Ruta histórica/alternativa del mismo recurso | HTTP 401 sin autenticación |
+| `https://fortnite-api.com/v2/news/stw` | GET | API key configurada en el proyecto | Mensajes/noticias de Salvar el Mundo | {api_status('/v2/news/stw')}; {compact_api['stwFeed']['messageCount']} mensaje(s) |
+| `https://fortnite-api.com/v2/news` | GET | API key configurada en el proyecto | Feed combinado; incluye clave `stw` | {api_status('/v2/news')} |
+| `https://fortnite-api.com/v2/shop` | GET | API key configurada en el proyecto | Tienda general | {api_status('/v2/shop')}; {compact_api['shopEntryCount'] if compact_api['shopEntryCount'] is not None else 'conteo no disponible'} entradas según el expediente |
+| `https://fortnite-api.com/v2/missions` | GET | — | Ruta candidata no documentada | {api_status('/v2/missions')} |
+| `https://fortnite-api.com/v2/alerts` | GET | — | Ruta candidata no documentada | {api_status('/v2/alerts')} |
+| `https://fortnite-api.com/v2/stw/missions` | GET | — | Ruta candidata no documentada | {api_status('/v2/stw/missions')} |
+| `https://fortnite-api.com/v2/stw/alerts` | GET | — | Ruta candidata no documentada | {api_status('/v2/stw/alerts')} |
+| `{EPIC_STW_WORLD_INFO}` | GET | Token de Epic requerido | `theaters`, `missions`, `missionAlerts` | {_status_line(epic_probes[0])} |
+| `{HISTORICAL_EPIC_STW_WORLD_INFO}` | GET | Token de Epic requerido actualmente | Ruta histórica/alternativa del mismo recurso | {_status_line(epic_probes[1])} |
 
-**Lectura correcta de los estados:** un HTTP 404 aquí significa “esa ruta no está disponible en Fortnite-API.com en esta consulta”; no significa que los datos de STW no existan en los servicios de Epic ni en rastreadores externos. El HTTP 401 de Epic confirma que el recurso existe detrás de autenticación, pero no autoriza a acceder a él sin una sesión válida.
+**Lectura correcta de los estados:** los códigos anteriores describen únicamente esta consulta. Un HTTP 404 significa que esa ruta no está disponible en Fortnite-API.com en este momento; un HTTP 401 de Epic indica que la consulta anónima requiere autenticación. Ninguno de esos estados demuestra que los datos no existan en otra fuente.
 
 ## Qué devolvió Fortnite-API.com
 
@@ -448,17 +499,17 @@ La fecha del feed es anterior a la fecha de consulta del expediente, por lo que 
 
 ### Free the V-Bucks
 
-La página pública [{FREETHEVBUCKS_TIMED}]({FREETHEVBUCKS_TIMED}) se pudo descargar con HTTP {public_page_evidence['freeTheVbucks']['httpStatus']} ({public_page_evidence['freeTheVbucks']['bodyBytes']} bytes). Su HTML contiene `expirationDates` y el aviso superior de la misión con pavos. En la captura de esta consulta se extrajo:
+La página pública [{FREETHEVBUCKS_TIMED}]({FREETHEVBUCKS_TIMED}) respondió `{free_status}` ({public_page_evidence['freeTheVbucks']['bodyBytes']} bytes). Su HTML contiene `expirationDates` y el aviso superior de la misión con pavos. En la captura de esta consulta se extrajo:
 
 {_json_fence(current_vbucks if current_vbucks else free_data)}
 
 ### Fortnite STW Planner
 
-La página pública [{STW_PLANNER_MISSIONS}]({STW_PLANNER_MISSIONS}) se pudo descargar con HTTP {public_page_evidence['stwPlanner']['httpStatus']} ({public_page_evidence['stwPlanner']['bodyBytes']} bytes). La tarjeta de recompensa se renderizó como:
+La página pública [{STW_PLANNER_MISSIONS}]({STW_PLANNER_MISSIONS}) respondió `{planner_status}` ({public_page_evidence['stwPlanner']['bodyBytes']} bytes). La tarjeta de recompensa se renderizó como:
 
 {_json_fence(planner_vbucks)}
 
-Los dos sitios coincidieron en la observación de esta consulta: **50 V-Bucks, PL 88, Category 4 / Fight the Storm en Twine Peaks**, con expiración indicada para `2026-09-10T00:00:00`/`2026-09-10T00:00:00Z` según el formato de cada página. Esto es una observación de fuentes comunitarias en un momento concreto, no una garantía oficial ni un valor que deba reutilizarse después de la expiración. Las páginas pueden estar cacheadas y las rotaciones diarias cambian.
+{agreement_text} En la lectura disponible se observó `{observed_text}`; las expiraciones encontradas fueron `{expiration_text}`. Esto es una observación de fuentes comunitarias en un momento concreto, no una garantía oficial ni un valor que deba reutilizarse después de la expiración. Las páginas pueden estar cacheadas y las rotaciones diarias cambian.
 
 FortniteDB también fue revisado como fuente especializada ([zona Twine Peaks]({FORTNITEDB_TWINE}), [buscador de misiones]({FORTNITEDB_MISSIONS})); durante esta ejecución su página entregó un desafío de Cloudflare, así que no se contó como prueba del dato actual. Sus antiguos documentos de Stoplight ([Premium FortniteDB API]({FORTNITEDB_API_DOCS})) no permitieron confirmar una especificación pública vigente ni una ruta JSON utilizable.
 
@@ -467,9 +518,9 @@ FortniteDB también fue revisado como fuente especializada ([zona Twine Peaks]({
 **Hechos comprobados:**
 
 - Las rutas de noticias y tienda de Fortnite-API.com respondieron y se conservaron en el expediente JSON generado por el proyecto.
-- Las cuatro rutas candidatas de misiones/alertas en Fortnite-API.com respondieron 404.
-- El endpoint de mundo STW de Epic respondió 401 sin credenciales; el cuerpo de error fue `errors.com.epicgames.common.authentication.authentication_failed`.
-- Dos páginas públicas server-rendered expusieron una tarjeta de 50 V-Bucks y el mismo PL 88/Twine Peaks durante esta consulta.
+- Las rutas candidatas de misiones/alertas en Fortnite-API.com devolvieron estos estados: {candidate_statuses}.
+- Los endpoints de mundo STW de Epic devolvieron: {epic_statuses}.
+- Las páginas públicas server-rendered devolvieron `{free_status}` y `{planner_status}`; su extracción produjo `{observed_text}`.
 
 **Interpretación:** la fuente técnicamente más completa es el endpoint de Epic porque la documentación de referencia enumera misiones y alertas; el bloqueo real es la autenticación. Fortnite-API.com funciona como fuente de noticias de STW, no como fuente de misiones en las rutas documentadas y probadas.
 
@@ -534,5 +585,5 @@ def save_deep_stw_report(document: dict[str, Any], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc)
     path = output_dir / f"{timestamp.strftime('%Y%m%dT%H%M%SZ')}-investigacion-profunda-stw.md"
-    path.write_text(document["markdown"], encoding="utf-8")
+    write_text_atomic(path, document["markdown"])
     return path

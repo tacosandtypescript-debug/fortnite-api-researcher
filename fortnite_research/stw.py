@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .client import FortniteAPIClient, FortniteAPIError
+from .transport import write_text_atomic
 
 
 DOCUMENTED_ENDPOINTS = (
@@ -111,6 +112,12 @@ def build_stw_report(client: FortniteAPIClient, language: str = "es") -> dict[st
     combined_record = next((item for item in documented if item["path"] == "/v2/news"), None)
     shop_record = next((item for item in documented if item["path"] == "/v2/shop"), None)
     missing_alerts = [item["path"] for item in probes if not item["available"]]
+    candidate_statuses = "; ".join(
+        f"{item['path']}: HTTP {item['httpStatus']}"
+        if item.get("httpStatus") is not None
+        else f"{item['path']}: sin respuesta"
+        for item in probes
+    )
     stw_payload = responses.get("/v2/news/stw")
     stw_data = stw_payload.get("data", {}) if isinstance(stw_payload, dict) else {}
     stw_feed_date = stw_data.get("date") if isinstance(stw_data, dict) else None
@@ -145,7 +152,11 @@ def build_stw_report(client: FortniteAPIClient, language: str = "es") -> dict[st
                 "documentedInReviewedFortniteApiDocs": False,
                 "testedCandidatePaths": [item["path"] for item in probes],
                 "pathsNotAvailable": missing_alerts,
-                "conclusion": "No hay una ruta pública documentada en Fortnite-API.com para obtener alertas diarias de misiones STW con pavos; las rutas candidatas probadas respondieron 404.",
+                "conclusion": (
+                    "No hay una ruta pública documentada en Fortnite-API.com para obtener "
+                    "alertas diarias de misiones STW con pavos. Estados observados: "
+                    f"{candidate_statuses}."
+                ),
             },
         },
         "documentedEndpointChecks": documented,
@@ -154,7 +165,11 @@ def build_stw_report(client: FortniteAPIClient, language: str = "es") -> dict[st
         "notes": [
             "La respuesta completa de /v2/news/stw y la respuesta combinada de /v2/news quedan incluidas para auditoría.",
             f"El campo date de /v2/news/stw recibido fue {stw_feed_date or 'null'}; es anterior a la hora de consulta y debe tratarse como contenido posiblemente desactualizado.",
-            "Una respuesta 404 demuestra que esa ruta no está disponible en esta API en la consulta realizada; no demuestra que no exista otra API externa con esos datos.",
+            (
+                "Los estados observados demuestran únicamente la disponibilidad de esas "
+                "rutas en esta API durante la consulta; no demuestran que no exista otra "
+                "API externa con esos datos."
+            ),
             "Para alertas de pavos se necesitaría otra fuente específica de misiones STW o un endpoint adicional que sea proporcionado y autorizado.",
         ],
     }
@@ -164,5 +179,5 @@ def save_stw_report(document: dict[str, Any], output_dir: Path) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc)
     path = output_dir / f"{timestamp.strftime('%Y%m%dT%H%M%SZ')}-salvar-el-mundo-endpoints.json"
-    path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
     return path

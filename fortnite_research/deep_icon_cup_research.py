@@ -17,12 +17,10 @@ No se guardan API keys, tokens de Telegram ni chat IDs en el snapshot.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import shutil
 import tempfile
 import urllib.parse
-import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -38,12 +36,15 @@ from .icon_cup_research import (
     FORTNITE_API_HOME,
     OFFICIAL_TEASER_URL,
     ORIGINAL_POST_URL,
+    _copy_reference_image,
+    _download_binary,
     _jpeg_dimensions,
     _read_public_post,
     _safe_public_json,
     _tweet_payload,
 )
 from .schedule_assets import _data, _download_image, _image_info, _slug
+from .transport import atomic_zipfile, write_bytes_atomic, write_text_atomic
 
 
 OFFICIAL_TEASER_ID = "2097762184587825499"
@@ -228,45 +229,13 @@ def _download_public_image(url: str, destination: Path, timeout: float) -> dict[
 
 
 def _download_public_video(url: str, destination: Path, timeout: float) -> dict[str, Any]:
-    from urllib.error import HTTPError, URLError
-    from urllib.request import Request, urlopen
-
-    request = Request(
+    return _download_binary(
         url,
-        headers={"Accept": "video/mp4,*/*", "User-Agent": "fortnite-api-researcher/0.1.0"},
-        method="GET",
+        destination,
+        timeout,
+        expected="video",
+        max_bytes=75_000_000,
     )
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            content_type = response.headers.get("Content-Type")
-            content = response.read(75_000_001)
-            status = int(response.status)
-    except HTTPError as exc:
-        return {"url": url, "downloaded": False, "httpStatus": exc.code, "errorType": "http"}
-    except (URLError, TimeoutError) as exc:
-        return {
-            "url": url,
-            "downloaded": False,
-            "httpStatus": None,
-            "errorType": "transport",
-            "detail": str(getattr(exc, "reason", exc))[:160],
-        }
-    if len(content) == 0 or len(content) > 75_000_000 or b"ftyp" not in content[:128]:
-        return {"url": url, "downloaded": False, "httpStatus": status, "errorType": "not_an_mp4"}
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(content)
-    return {
-        "url": url,
-        "downloaded": True,
-        "httpStatus": status,
-        "contentType": content_type,
-        "bytes": len(content),
-        "sha256": hashlib.sha256(content).hexdigest(),
-        "format": "MP4",
-        "width": None,
-        "height": None,
-        "path": destination.as_posix(),
-    }
 
 
 def _type_value(value: Any) -> str:
@@ -364,8 +333,28 @@ def _build_report(
     failed = [item for item in asset_entries if not item.get("downloaded")]
     delivery = [item for item in successful if item.get("telegramDelivery")]
     type_counts = Counter(_spanish_type("br", record) for record in related_br)
+    catalog_summary = ", ".join(
+        f"{label}: {count}" for label, count in sorted(type_counts.items())
+    ) or "sin registros"
+    outfit_names = ", ".join(
+        str(record.get("name") or "sin nombre")
+        for record in related_br
+        if _type_value(record.get("type")) == "Outfit"
+    ) or "ninguno"
     post = snapshot.get("publicSources", {}).get("originalPostNormalized") or {}
     teaser = snapshot.get("publicSources", {}).get("officialTeaserNormalized") or {}
+    post_date = str(post.get("createdAt") or "fecha no disponible")
+    teaser_date = str(teaser.get("createdAt") or "fecha no disponible")
+    outfit_count = sum(
+        1 for record in related_br if _type_value(record.get("type")) == "Outfit"
+    )
+    track_names = ", ".join(
+        str(record.get("title") or "sin título") for record in related_tracks
+    ) or "ninguna"
+    instrument_names = ", ".join(
+        str(record.get("name") or "sin nombre")
+        for record in related_instruments
+    ) or "ninguno"
 
     lines = [
         "# Investigación profunda: Weezy Icon Cup / Lil Wayne",
@@ -376,7 +365,7 @@ def _build_report(
         "",
         "## Resultado nuevo respecto a la consulta anterior",
         "",
-        f"La API ya no devuelve solamente los cinco objetos del primer snapshot: ahora devuelve **{len(related_br)} registros de Battle Royale del set `Lil Wayne`**, **{len(related_tracks)} canciones de Fortnite Festival** y **{len(related_instruments)} instrumento** relacionado. La tanda inicial llegó a las `16:00:38Z`; la segunda tanda de cosméticos apareció a las `16:36:49Z`. Esto documenta una actualización progresiva del catálogo, no una promesa de que todos los objetos ya estén disponibles en la tienda.",
+        f"La API devuelve **{len(related_br)} registros de Battle Royale del set `Lil Wayne`**, **{len(related_tracks)} canciones de Fortnite Festival** y **{len(related_instruments)} instrumento(s)** relacionado(s). El desglose actual es {catalog_summary}. Si existen valores `added`, se conservan en el inventario; esta ejecución documenta el estado observado y no promete disponibilidad en tienda.",
         "",
         "### Conteo actual de Battle Royale",
         "",
@@ -389,18 +378,18 @@ def _build_report(
     lines.extend(
         [
             "",
-            "**Lectura importante:** ahora sí hay dos atuendos catalogados, `Weezy` y `Lil Wayne`. Eso fortalece mucho la pista de “2 skins”, pero la API no asigna por sí sola esos atuendos como premio de la copa ni confirma su precio o fecha de tienda.",
+            f"**Lectura importante:** hay {sum(1 for record in related_br if _type_value(record.get('type')) == 'Outfit')} atuendo(s) catalogado(s): {outfit_names}. La API no asigna por sí sola esos atuendos como premio de la copa ni confirma su precio o fecha de tienda.",
             "",
             "## Qué está confirmado y qué no",
             "",
             "| Dato | Nivel | Evidencia |",
             "|---|---|---|",
             "| Colaboración de Lil Wayne / Weezy | Alto | Teaser de Epic + registros `Lil Wayne` en la API |",
-            "| Dos atuendos distintos | Alto como catálogo | `Character_NoiseClueGust` y `Character_NoiseClueLurch` |",
-            "| Dos emotes | Alto como catálogo | `6 Foot 7 Foot` y `Lollipop` |",
-            "| Tres canciones de Festival | Alto como catálogo | categoría `tracks` de `/v2/cosmetics/new` |",
-            "| Una copa el sábado 12 | Medio-alto | Post de `@FNcompReport`; falta la ficha oficial de Epic |",
-            "| Solo Battle Royale y Solo Zero Build | Medio-alto | Texto de la imagen/post; falta el reglamento |",
+            f"| Atuendos distintos | Alto como catálogo | {outfit_names} |",
+            f"| Emotes | Alto como catálogo | {type_counts.get('Emote', 0)} registro(s) en este snapshot |",
+            f"| Canciones de Festival | Alto como catálogo | {len(related_tracks)} registro(s) relacionados |",
+            "| Copa y fecha concreta | Pendiente | Post comunitario; falta revalidación oficial automática |",
+            "| Modos indicados por el post | Pendiente | Texto de la imagen/post; falta el reglamento |",
             "| Premio exacto | Desconocido | No hay mapeo de recompensa en Fortnite-API.com |",
             "| Hora, regiones, duración, puntos y partidas | Desconocido | No hay endpoint público de torneos en esta API |",
             "| Fecha de salida en tienda | Desconocido | `/v2/shop` no mostró coincidencias en este snapshot |",
@@ -446,7 +435,7 @@ def _build_report(
             "",
             "## Música e instrumento detectados",
             "",
-            "La misma respuesta de novedades contiene tres registros de Festival. En el catálogo consultado aparecen como `tracks`, no como cosméticos BR; por eso los separo de skins, picos y accesorios.",
+            f"La respuesta de novedades contiene {len(related_tracks)} registro(s) de Festival. En el catálogo consultado aparecen como `tracks`, no como cosméticos BR; por eso los separo de skins, picos y accesorios.",
             "",
             "| Canción | Artista | Año | BPM | Duración | ID de catálogo |",
             "|---|---|---:|---:|---:|---|",
@@ -470,19 +459,18 @@ def _build_report(
             "",
             "## Lectura temática de nombres y contenido",
             "",
-            "- `Weezy` y `Lil Wayne` son dos IDs de atuendo distintos. El primero incluye canales de sombrero, gafas, camiseta sin mangas y reactividad; el segundo incluye gafas y reactividad.",
-            "- `Weezy Board` y `Weezy Boardbreaker` introducen una línea visual de tabla/skate; la API los clasifica como accesorio mochilero y pico.",
-            "- `Milli Bricks`, `Young Money Stage`, `YM Burner` y `YM` apuntan al branding de Young Money; eso es una lectura de nombres y no un anuncio de recompensas.",
-            "- `Tha Guitar` aparece como Back Bling, Pickaxe y como instrumento de Festival. Son tres registros de catálogo distintos con el mismo nombre; no deben contarse como una sola pieza.",
-            "- `Lollipop`, `A Milli (2023 Remix)` y `6 Foot 7 Foot` son canciones catalogadas, mientras que `Lollipop` y `6 Foot 7 Foot` también tienen emotes separados. El nombre compartido no significa que sean el mismo objeto.",
+            f"- Los atuendos actuales del inventario son: {outfit_names}. Sus variantes y canales se detallan a partir de los datos de esta ejecución.",
+            f"- El inventario observado se resume en: {catalog_summary}. Los nombres compartidos entre categorías no implican que sean el mismo objeto.",
+            f"- Las canciones relacionadas son: {track_names}; los instrumentos relacionados son: {instrument_names}. Se conservan como categorías separadas del catálogo BR.",
+            "- La semántica de los nombres puede sugerir una temática, pero no constituye un anuncio de recompensas.",
             "",
             "## Estado competitivo del torneo",
             "",
-            f"El {_md_link('post de FNcompReport', ORIGINAL_POST_URL)} recuperado en el espejo público dice: `{str(post.get('text') or 'no disponible').replace(chr(10), ' / ')}`. La imagen aportada anuncia Solo Battle Royale y Solo Zero Build para el sábado 12 de septiembre. Se conserva como reporte comunitario; no es el reglamento de Epic.",
+            f"El {_md_link('post de FNcompReport', ORIGINAL_POST_URL)} recuperado en el espejo público dice: `{str(post.get('text') or 'no disponible').replace(chr(10), ' / ')}` y figura con fecha `{post_date}`. La imagen aportada se conserva como evidencia comunitaria; sus modos y fechas no se tratan como reglamento de Epic.",
             "",
             f"La {_md_link('página oficial de Item Shop Cups', EPIC_ITEM_SHOP_CUPS_URL)} explica que estas copas son torneos especiales de un día, que cada una puede tener modo y tamaño de equipo propio, que pueden ser multiplataforma o restringidas a consola/móvil y que cada copa tiene su propio reglamento y premios cosméticos. Es el marco oficial aplicable a este tipo de evento, no la confirmación de la Weezy Cup.",
             "",
-            f"En la {_md_link('agenda competitiva oficial', EPIC_COMPETITIVE_NAC_URL)} consultada para NAC el 10 de septiembre aparecen otros eventos el 12 de septiembre —FNCS Division 1 Practice y Mobile Series Group Stage—, pero no una ficha visible llamada Weezy Icon Cup. En la {_md_link('biblioteca oficial de reglas', EPIC_RULES_LIBRARY_URL)} también aparecen otros reglamentos de Chapter 7 Season 4, sin un documento identificable como Weezy Icon Cup. La ausencia de la página pública no prueba que el evento no exista dentro del cliente; solo limita la confirmación pública.",
+            f"La {_md_link('agenda competitiva oficial', EPIC_COMPETITIVE_NAC_URL)} y la {_md_link('biblioteca oficial de reglas', EPIC_RULES_LIBRARY_URL)} se conservan como fuentes de revalidación. Esta ejecución no convierte la ausencia o presencia de una ficha pública en prueba de disponibilidad dentro del cliente.",
             "",
             "### Lo que no voy a inventar a partir del catálogo",
             "",
@@ -490,7 +478,7 @@ def _build_report(
             "",
             "## Teaser y fuentes externas",
             "",
-            f"La {_md_link('publicación oficial de Fortnite', OFFICIAL_TEASER_URL)} tiene un teaser; el espejo público la fecha el 9 de septiembre de 2026 y reporta vídeo. {_md_link('Beebom', BEEBOM_URL)} lo identifica como una llegada de Lil Wayne, pero sus predicciones sobre cantidad de skins, emotes o Jam Tracks se tratan como cobertura secundaria. El catálogo actual aporta ahora evidencia directa de dos atuendos y tres canciones, pero no convierte en oficiales los precios, fechas o premios.",
+            f"La {_md_link('publicación oficial de Fortnite', OFFICIAL_TEASER_URL)} tiene un teaser; el espejo público lo fecha como `{teaser_date}` y normaliza {len(teaser.get('videos') or [])} recurso(s) de vídeo. {_md_link('Beebom', BEEBOM_URL)} se trata como cobertura secundaria. El catálogo actual aporta {outfit_count} atuendo(s) y {len(related_tracks)} canción(es), pero no convierte en oficiales los precios, fechas o premios.",
             "",
             "## Auditoría de endpoints",
             "",
@@ -559,14 +547,23 @@ def _build_report(
             "",
             "## Conclusión",
             "",
-            "La investigación profunda encontró una segunda tanda importante de recursos: ya hay dos skins catalogadas, cinco accesorios/picos adicionales distribuidos entre ambas tandas, dos emotes, un emoticono, tres canciones y una guitarra de Festival. Eso confirma que el paquete de Lil Wayne es bastante más amplio que los cinco objetos iniciales. Lo que sigue sin prueba pública es lo específico de la copa: premio, puntuación, hora, región y regla final. Esos datos deben verificarse en la pestaña Competir o en el reglamento de Epic antes de tratarlos como definitivos.",
+            f"La investigación profunda encontró {len(related_br)} registro(s) BR, {outfit_count} atuendo(s), {len(related_tracks)} canción(es) ({track_names}) y {len(related_instruments)} instrumento(s). Eso describe el catálogo observado en esta ejecución; no confirma premio, puntuación, hora, región ni reglamento de la copa. Esos datos deben verificarse en la pestaña Competir o en el reglamento de Epic antes de tratarlos como definitivos.",
             "",
         ]
     )
     return "\n".join(line for line in lines if line != " | ")
 
 
-def _public_media_urls(client_timeout: float) -> tuple[list[dict[str, Any]], dict[str, Any] | None, dict[str, Any] | None]:
+def _public_media_urls(
+    client_timeout: float,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Any] | None,
+    dict[str, Any] | None,
+    str,
+    str,
+    str,
+]:
     checks, post = _read_public_post(client_timeout)
     teaser_check, teaser_raw = _safe_public_json(f"https://api.fxtwitter.com/status/{OFFICIAL_TEASER_ID}", client_timeout)
     checks.append(teaser_check)
@@ -586,7 +583,7 @@ def _public_media_urls(client_timeout: float) -> tuple[list[dict[str, Any]], dic
             if isinstance(video, dict) and isinstance(video.get("thumbnail_url"), str):
                 thumb_url = video["thumbnail_url"]
                 break
-    return checks, post, teaser
+    return checks, post, teaser, poster_url, video_url, thumb_url
 
 
 def build_deep_icon_cup_research_package(
@@ -638,7 +635,14 @@ def build_deep_icon_cup_research_package(
     # record that the search returns, even if its free text has no keyword.
     related["br"] = [_record_summary(record, "br") for record in set_records]
 
-    public_checks, post, teaser = _public_media_urls(timeout)
+    (
+        public_checks,
+        post,
+        teaser,
+        poster_url,
+        teaser_video_url,
+        teaser_thumb_url,
+    ) = _public_media_urls(timeout)
     raw_focused = {
         "newCosmetics": values.get("newCosmetics"),
         "setLilWayne": values.get("setLilWayne"),
@@ -669,9 +673,9 @@ def build_deep_icon_cup_research_package(
             "originalPostNormalized": post,
             "officialTeaser": OFFICIAL_TEASER_URL,
             "officialTeaserNormalized": teaser,
-            "posterUrl": POSTER_FALLBACK_URL,
-            "teaserVideoUrl": OFFICIAL_TEASER_VIDEO_FALLBACK,
-            "teaserThumbUrl": OFFICIAL_TEASER_THUMB_FALLBACK,
+            "posterUrl": poster_url,
+            "teaserVideoUrl": teaser_video_url,
+            "teaserThumbUrl": teaser_thumb_url,
         },
         "sourceUrls": {
             "originalPost": ORIGINAL_POST_URL,
@@ -690,39 +694,23 @@ def build_deep_icon_cup_research_package(
     chosen_by_record: dict[str, dict[str, Any]] = {}
     try:
         # Keep the user-provided reference in the local evidence package.
-        if reference_image is not None and reference_image.is_file():
-            content = reference_image.read_bytes()
-            info = _image_info(content, "image/jpeg")
-            width, height = _jpeg_dimensions(content)
-            if width is None:
-                width, height = info.get("width"), info.get("height")
-            relative = Path("assets") / "reference" / reference_image.name
-            destination = staging_dir / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(content)
-            asset_entries.append(
+        if reference_image is not None:
+            reference_info = _copy_reference_image(reference_image, staging_dir)
+            reference_info.update(
                 {
-                    "kind": "user_reference",
                     "label": "reference-post",
-                    "url": None,
-                    "downloaded": True,
-                    "path": relative.as_posix(),
-                    "format": info.get("format"),
-                    "width": width,
-                    "height": height,
-                    "bytes": len(content),
-                    "sha256": hashlib.sha256(content).hexdigest(),
                     "caption": "Referencia de la publicación — imagen original del torneo",
                     "telegramDelivery": False,
                 }
             )
+            asset_entries.append(reference_info)
 
         # Public evidence. They remain local in this deep package, but are not
         # necessarily re-sent if the user already received them earlier.
         public_downloads = (
-            ("tournament-post", POSTER_FALLBACK_URL, "image", ".jpg", "Weezy Icon Cup — póster del torneo publicado por FNcompReport"),
-            ("official-teaser", OFFICIAL_TEASER_VIDEO_FALLBACK, "video", ".mp4", "Teaser oficial de Fortnite — vídeo original"),
-            ("official-teaser-thumb", OFFICIAL_TEASER_THUMB_FALLBACK, "image", ".jpg", "Teaser oficial de Fortnite — miniatura original"),
+            ("tournament-post", poster_url, "image", ".jpg", "Weezy Icon Cup — póster del torneo publicado por FNcompReport"),
+            ("official-teaser", teaser_video_url, "video", ".mp4", "Teaser oficial de Fortnite — vídeo original"),
+            ("official-teaser-thumb", teaser_thumb_url, "image", ".jpg", "Teaser oficial de Fortnite — miniatura original"),
         )
         for label, url, kind, extension, caption in public_downloads:
             relative = Path("assets") / "public" / f"{_slug(label)}{extension}"
@@ -817,8 +805,8 @@ def build_deep_icon_cup_research_package(
         snapshot_path = output_dir / f"{timestamp_label}-api-snapshot-deep-weezy.json"
         manifest_path = output_dir / f"{timestamp_label}-manifest-deep-weezy.json"
         archive_path = output_dir / f"{timestamp_label}-recursos-deep-weezy-icon-cup.zip"
-        report_path.write_text(report, encoding="utf-8")
-        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_text_atomic(report_path, report)
+        write_text_atomic(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
         manifest = {
             "generatedAt": retrieved_iso,
             "source": "Fortnite-API.com + public X syndication + Epic public sources + attached reference image",
@@ -827,10 +815,10 @@ def build_deep_icon_cup_research_package(
             "selectedDelivery": list(chosen_by_record.values()),
             "failedDownloads": [item for item in asset_entries if not item.get("downloaded")],
         }
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
 
         # Add report/snapshot/manifest and all binary files to a local backup.
-        with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        with atomic_zipfile(archive_path, compresslevel=6) as archive:
             archive.write(report_path, arcname="INFORME-profundo-weezy-icon-cup.md")
             archive.write(snapshot_path, arcname="api-snapshot-deep-weezy.json")
             archive.write(manifest_path, arcname="manifest-deep-weezy.json")
@@ -852,7 +840,7 @@ def build_deep_icon_cup_research_package(
             if not source.is_file():
                 continue
             destination = stable_dir / source.name
-            shutil.copyfile(source, destination)
+            write_bytes_atomic(destination, source.read_bytes())
             copied = dict(item)
             copied["path"] = destination.as_posix()
             stable_entries.append(copied)
@@ -868,9 +856,9 @@ def build_deep_icon_cup_research_package(
             for item in stable_entries
             if item.get("telegramDelivery") and item.get("downloaded")
         ]
-        snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        write_text_atomic(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
+        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        with atomic_zipfile(archive_path, compresslevel=6) as archive:
             archive.write(report_path, arcname="INFORME-profundo-weezy-icon-cup.md")
             archive.write(snapshot_path, arcname="api-snapshot-deep-weezy.json")
             archive.write(manifest_path, arcname="manifest-deep-weezy.json")

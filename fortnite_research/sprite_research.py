@@ -20,7 +20,6 @@ import mimetypes
 import shutil
 import tempfile
 import urllib.parse
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,6 +27,7 @@ from typing import Any
 
 from .client import FortniteAPIClient, FortniteAPIError
 from .schedule_assets import _data, _download_image, _image_info, _slug
+from .transport import atomic_zipfile, write_bytes_atomic, write_text_atomic
 
 
 ORIGINAL_POST_URL = "https://x.com/fnbrunderground/status/2098035630483591223?s=46"
@@ -301,7 +301,7 @@ def _copy_reference_image(source: Path, staging_dir: Path) -> dict[str, Any]:
     relative = Path("assets") / "referencia" / source.name
     destination = staging_dir / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(content)
+    write_bytes_atomic(destination, content)
     return {
         "kind": "user_reference",
         "sourceName": source.name,
@@ -608,7 +608,7 @@ def build_sprite_research_package(
         timestamp_label = retrieved_at.strftime("%Y%m%dT%H%M%SZ")
         report_path = output_dir / f"{timestamp_label}-investigacion-loot-hacker-sprites.md"
         archive_path = output_dir / f"{timestamp_label}-recursos-loot-hacker-sprites.zip"
-        report_path.write_text(report, encoding="utf-8")
+        write_text_atomic(report_path, report)
 
         manifest = {
             "generatedAt": retrieved_iso,
@@ -620,19 +620,11 @@ def build_sprite_research_package(
         }
         snapshot_path = staging_dir / "api_snapshot.json"
         manifest_path = staging_dir / "manifest.json"
-        snapshot_path.write_text(
-            json.dumps(api_snapshot, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
+        write_text_atomic(snapshot_path, json.dumps(api_snapshot, ensure_ascii=False, indent=2) + "\n")
+        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
 
-        with zipfile.ZipFile(
+        with atomic_zipfile(
             archive_path,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
             compresslevel=6,
         ) as archive:
             archive.write(report_path, arcname="INFORME-loot-hacker-sprites.md")

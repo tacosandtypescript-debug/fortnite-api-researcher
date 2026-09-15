@@ -12,6 +12,7 @@ from .config import Settings
 from .deep_stw import build_deep_stw_report, save_deep_stw_report
 from .deep_icon_cup_research import build_deep_icon_cup_research_package
 from .icon_cup_research import build_icon_cup_research_package
+from .penny_bot import run_penny_bot
 from .video_brief import build_video_brief
 from .regions import build_region_report, save_region_report
 from .report import save_result
@@ -34,13 +35,22 @@ def _params(values: list[str]) -> dict[str, str]:
 
 
 def _telegram_sender(settings: Settings) -> TelegramDocumentSender:
-    """Prepara el envío sin mostrar ni persistir credenciales o chat ID."""
+    """Prepara el envío sin descubrir chats salvo autorización explícita."""
     sender = TelegramDocumentSender(settings.telegram_bot_token, settings.telegram_chat_id)
-    if not sender.chat_id:
+    if not sender.chat_id and settings.telegram_allow_chat_discovery:
         sender.chat_id = sender.find_recent_start_chat_id()
-    if not sender.chat_id:
+    if not sender.chat_id and settings.telegram_allow_chat_discovery:
         sender.chat_id = sender.find_recent_private_chat_id()
     return sender
+
+
+def _client(settings: Settings) -> FortniteAPIClient:
+    return FortniteAPIClient(
+        settings.api_base_url,
+        settings.api_key,
+        settings.api_timeout,
+        trusted_api_hosts=settings.api_trusted_hosts,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -63,6 +73,27 @@ def build_parser() -> argparse.ArgumentParser:
     stw_deep = sub.add_parser("stw-deep", help="Busca a fondo fuentes de misiones y alertas de pavos STW")
     stw_deep.add_argument("--language", default="es")
     stw_deep.add_argument("--send", action="store_true", help="Envía la investigación Markdown como documento por Telegram")
+
+    bot = sub.add_parser(
+        "bot",
+        help="Monitoriza Penny y avisa por Telegram de pavos, llamas, cosméticos y noticias",
+    )
+    bot.add_argument(
+        "--interval",
+        type=float,
+        default=None,
+        help="Segundos entre consultas; por defecto PENNY_POLL_INTERVAL_SECONDS",
+    )
+    bot.add_argument(
+        "--once",
+        action="store_true",
+        help="Consulta y notifica una sola vez, sin quedarse ejecutándose",
+    )
+    bot.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Muestra la alerta sin enviarla a Telegram",
+    )
 
     cosmetic = sub.add_parser("cosmetic-search", help="Busca cosméticos de Battle Royale")
     cosmetic.add_argument("--name", required=True)
@@ -138,13 +169,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         settings = Settings.load()
+        if args.command == "bot":
+            return run_penny_bot(
+                settings,
+                interval=args.interval,
+                once=args.once,
+                dry_run=args.dry_run,
+            )
         if args.command == "send-file":
             sender = _telegram_sender(settings)
             sender.send_document(args.path, caption=args.caption)
             print(f"ENVIADO POR TELEGRAM: {args.path}")
             return 0
         if args.command == "servers":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             api_checks: dict[str, dict] = {}
             for path in ("/v1/status", "/v1/servers", "/v1/regions"):
                 try:
@@ -164,7 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"GUARDADO: {output_path}")
             return 0
         if args.command == "stw":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             document = build_stw_report(client, args.language)
             output_path = save_stw_report(document, settings.output_dir)
             label = "salvar-el-mundo-endpoints"
@@ -177,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"GUARDADO: {output_path}")
             return 0
         if args.command == "stw-deep":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             document = build_deep_stw_report(client, args.language, settings.api_timeout)
             output_path = save_deep_stw_report(document, settings.output_dir)
             should_send = args.send or settings.auto_send_telegram
@@ -189,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"GUARDADO: {output_path}")
             return 0
         if args.command == "schedule-assets":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             artifacts = build_schedule_package(
                 client,
                 settings.output_dir,
@@ -219,7 +257,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"REGISTROS POR OBJETIVO: {artifacts.target_counts}")
             return 0
         if args.command == "banners":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             delivery = prepare_wolverine_banners(
                 client,
                 settings.output_dir,
@@ -238,7 +276,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"BANNERS: {len(delivery.files)}; BYTES: {delivery.bytes_total}")
             return 0
         if args.command == "sprites-research":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             artifacts = build_sprite_research_package(
                 client,
                 settings.output_dir,
@@ -270,7 +308,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"API {probe.get('name')}: HTTP {probe.get('httpStatus')}")
             return 0
         if args.command == "icon-cup-research":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             artifacts = build_icon_cup_research_package(
                 client,
                 settings.output_dir,
@@ -302,7 +340,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"API {probe.get('name')}: HTTP {probe.get('httpStatus')}")
             return 0
         if args.command == "deep-icon-cup-research":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             artifacts = build_deep_icon_cup_research_package(
                 client,
                 settings.output_dir,
@@ -340,7 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"API {probe.get('name')}: HTTP {probe.get('httpStatus')}")
             return 0
         if args.command == "video-brief":
-            client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+            client = _client(settings)
             artifacts = build_video_brief(
                 client,
                 settings.output_dir,
@@ -366,7 +404,7 @@ def main(argv: list[str] | None = None) -> int:
             for probe in artifacts.api_probes:
                 print(f"API {probe.get('name')}: HTTP {probe.get('httpStatus')}")
             return 0
-        client = FortniteAPIClient(settings.api_base_url, settings.api_key, settings.api_timeout)
+        client = _client(settings)
         if args.command == "shop":
             result = client.shop(args.language)
             label = f"tienda-{args.language}"

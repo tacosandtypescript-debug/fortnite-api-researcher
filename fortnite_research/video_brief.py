@@ -30,6 +30,7 @@ from .icon_cup_research import (
     ORIGINAL_POST_URL,
     _read_public_post,
 )
+from .transport import write_text_atomic
 
 
 # These are the event pages found during the live deep check. Fortnite-API.com
@@ -167,9 +168,89 @@ def build_video_brief(
     set_summaries = [_record_summary(record, "br") for record in set_records]
     outfits = [record for record in set_records if _type_value(record.get("type")) == "Outfit"]
     type_counts = Counter(_spanish_type("br", record) for record in set_records)
+    outfit_names = ", ".join(
+        str(record.get("name") or "sin nombre") for record in outfits
+    ) or "ninguno"
+    track_titles = ", ".join(
+        str(item.get("title") or "sin título") for item in tracks
+    ) or "ninguna"
+    instrument_names = ", ".join(
+        str(item.get("name") or item.get("title") or "sin nombre")
+        for item in instruments
+    ) or "ninguno"
+    catalog_summary = ", ".join(
+        f"{label}: {count}" for label, count in sorted(type_counts.items())
+    ) or "sin registros"
+    status_by_name = {
+        str(probe.get("name")): (
+            f"HTTP {probe.get('httpStatus')}"
+            if probe.get("httpStatus") is not None
+            else "sin respuesta"
+        )
+        for probe in probes
+    }
+    tournament_probe_statuses = "; ".join(
+        f"{name}: {status_by_name.get(name, 'sin datos')}"
+        for name in ("eventsV1", "eventsV2", "tournamentsV1", "tournamentsV2")
+    )
+    official_event = WEEZY_EVENT_FACTS["officialEpic"]
+    public_event = WEEZY_EVENT_FACTS["publicEventFeed"]
+    score_text = ", ".join(
+        f"{label} +{points}"
+        for label, points in public_event.get("scoring", {}).items()
+    )
+    prize_text = "; ".join(
+        f"{item.get('condition')}: {', '.join(item.get('items', []))}"
+        for item in public_event.get("prizes", [])
+    ) or "no configurado"
+    event_modes = " y ".join(official_event.get("modes", [])) or "modo no indicado"
+    event_date = str(official_event.get("date") or "fecha no indicada")
+    event_time = (
+        f"{official_event.get('displayedStart', 'n/d')}–"
+        f"{official_event.get('displayedEnd', 'n/d')}"
+    )
+    tiebreaker_text = ", ".join(public_event.get("tiebreaker", [])) or "no indicado"
+    prize_by_condition = {
+        str(item.get("condition")): ", ".join(item.get("items", []))
+        for item in public_event.get("prizes", [])
+        if item.get("condition")
+    }
+    placement_prize = prize_by_condition.get("Top 700", "no configurado")
+    points_prize = next(
+        (
+            f"{condition}: {items}"
+            for condition, items in prize_by_condition.items()
+            if condition != "Top 700"
+        ),
+        "no configurado",
+    )
+    visual_names = ", ".join(
+        str(record.get("name") or "sin nombre") for record in set_records[:5]
+    ) or "no hay registros"
+    outfit_voice = (
+        f"Los atuendos catalogados son {outfit_names}."
+        if outfits
+        else "No hay atuendos catalogados en este snapshot."
+    )
+    snapshot_event_evidence = {
+        **WEEZY_EVENT_FACTS,
+        "verification": {
+            "mode": "configured_snapshot",
+            "revalidatedInThisRun": False,
+            "note": "Los datos competitivos están configurados en el repositorio y no se vuelven a consultar automáticamente.",
+        },
+    }
     public_checks, post = _read_public_post(timeout)
     post_text = str((post or {}).get("text") or "no disponible").replace("\n", " / ")
     post_date = str((post or {}).get("createdAt") or "no disponible")
+    public_check_summary = "; ".join(
+        (
+            f"HTTP {check.get('httpStatus')}"
+            if check.get("httpStatus") is not None
+            else str(check.get("errorType") or "sin respuesta")
+        )
+        for check in public_checks
+    ) or "sin comprobaciones"
 
     snapshot = {
         "investigation": {
@@ -191,7 +272,7 @@ def build_video_brief(
             "publicMirrorChecks": public_checks,
             "officialTeaser": OFFICIAL_TEASER_URL,
         },
-        "eventEvidence": WEEZY_EVENT_FACTS,
+        "eventEvidence": snapshot_event_evidence,
     }
 
     lines = [
@@ -202,30 +283,30 @@ def build_video_brief(
         "",
         "## Veredicto para el video",
         "",
-        "La colaboración de Lil Wayne ya tiene una huella muy clara en el catálogo: dos skins, accesorios, dos emotes, un emoticono, tres canciones de Festival y una guitarra. La diferencia importante de esta revisión es que la Weezy Icon Cup ya aparece en la ficha oficial de Competitivo de Fortnite para NAC, el sábado 12 de septiembre, con Battle Royale y Zero Build en solitario.",
+        f"La colaboración de Lil Wayne tiene {len(set_records)} registros BR en el snapshot ({catalog_summary}), {len(tracks)} canciones de Festival y {len(instruments)} instrumento(s) relacionado(s). Los atuendos encontrados son: {outfit_names}. La ficha competitiva configurada para esta investigación indica {official_event.get('region')} el {official_event.get('date')}, con {', '.join(official_event.get('modes', [])) or 'modo no indicado'}.",
         "",
-        "El anuncio comunitario de FNcompReport quedó corroborado por Epic. La API de Fortnite-API.com confirma los cosméticos, mientras que el horario, la puntuación y los premios salen de la página oficial de Competitivo y de los datos públicos del evento que muestra Fortnite Tracker.",
+        "La API de Fortnite-API.com confirma los cosméticos. Los datos competitivos proceden de un snapshot configurado en el repositorio; esta ejecución no revalida automáticamente la página de Epic ni el feed público de Fortnite Tracker.",
         "",
         "## Ficha competitiva encontrada",
         "",
         "| Dato | Resultado actual | Fuente |",
         "|---|---|---|",
-        "| Región consultada | NAC | Calendario oficial |",
-        "| Fecha y hora | Sábado 12 de septiembre, 5:00 p. m.–8:00 p. m. | Calendario oficial NAC |",
-        "| Modos | Solo Battle Royale y Solo Zero Build | Rondas oficiales del evento |",
-        "| Plataformas | Xbox, PlayStation, teléfonos, PC y Nintendo Switch | Ficha oficial |",
-        "| Premio por colocación | Top 700: `Weezy` + `Weezy Board` | Feed público del evento |",
-        "| Premio por puntos | 8 puntos: `YM` | Feed público del evento |",
-        "| Partidas máximas | 11 | Feed público del evento |",
-        "| Requisitos explícitos | 13 años o edad mínima local y AMF/MFA habilitada | Ficha oficial |",
+        f"| Región consultada | {official_event.get('region', 'no indicada')} | Snapshot configurado |",
+        f"| Fecha y hora | {official_event.get('date', 'no indicada')}, {official_event.get('displayedStart', 'n/d')}–{official_event.get('displayedEnd', 'n/d')} | Snapshot configurado |",
+        f"| Modos | {', '.join(official_event.get('modes', [])) or 'no indicados'} | Snapshot configurado |",
+        f"| Plataformas | {', '.join(official_event.get('platformsListed', [])) or 'no indicadas'} | Snapshot configurado |",
+        f"| Premio por colocación | {next((item.get('condition', 'n/d') + ': ' + ', '.join(item.get('items', [])) for item in public_event.get('prizes', []) if item.get('condition') == 'Top 700'), 'no configurado')} | Snapshot configurado |",
+        f"| Premio por puntos | {next((item.get('condition', 'n/d') + ': ' + ', '.join(item.get('items', [])) for item in public_event.get('prizes', []) if item.get('condition') != 'Top 700'), 'no configurado')} | Snapshot configurado |",
+        f"| Partidas máximas | {public_event.get('matchCap', 'no indicado')} | Snapshot configurado |",
+        f"| Requisitos explícitos | {official_event.get('minimumAge', 'n/d')} años; MFA: {'sí' if official_event.get('mfaRequired') else 'no indicada'} | Snapshot configurado |",
         "",
-        "El calendario oficial muestra las mismas 5:00 p. m.–8:00 p. m. para las dos rondas en NAC. Confirma la hora en la pestaña Competir de tu cuenta si juegas desde otra región o si el cliente convierte la zona horaria.",
+        f"El snapshot configurado muestra {official_event.get('displayedStart', 'n/d')}–{official_event.get('displayedEnd', 'n/d')} para {official_event.get('region', 'la región indicada')}. Confirma la hora en la pestaña Competir de tu cuenta si juegas desde otra región o si el cliente convierte la zona horaria.",
         "",
         "## Qué aporta cada fuente",
         "",
-        "- Fortnite-API.com: confirma el catálogo del set `Lil Wayne`, las pistas de Festival y `Tha Guitar`; las rutas probadas de eventos/torneos devolvieron 404.",
-        "- Epic Games: confirma que la Copa de ídolos de Weezy existe, sus modos, la fecha de NAC, las plataformas, las regiones visibles y los requisitos básicos.",
-        "- Fortnite Tracker: expone los datos públicos del evento que permiten leer puntuación, límite de 11 partidas y premios; sus páginas son una fuente secundaria del feed de evento, no la biblioteca oficial de reglas.",
+        f"- Fortnite-API.com: confirma el catálogo del set `Lil Wayne`, {len(tracks)} pista(s) de Festival y {instrument_names}; estados de las rutas de eventos/torneos: {tournament_probe_statuses}.",
+        "- Epic Games y Fortnite Tracker: los datos competitivos se mantienen como snapshot configurado y deben revalidarse antes de publicar el video; no se consultan automáticamente en esta ejecución.",
+        f"- Puntuación y premios configurados: {score_text or 'no disponibles'}; {prize_text}.",
         "",
         "## Guion de locución",
         "",
@@ -235,68 +316,68 @@ def build_video_brief(
         "",
         "### Qué se anunció — 0:07–0:17",
         "",
-        f"“El reporte de [FNcompReport]({ORIGINAL_POST_URL}) adelantó una copa para el sábado 12 de septiembre. Ya no es solo un rumor: la ficha oficial de [Copa de ídolos de Weezy]({EPIC_WEEZY_EVENT_BR_URL}) la muestra para NAC en Solo Battle Royale y Solo Zero Build, de 5:00 a 8:00 de la tarde.”",
+        f"“El reporte de [FNcompReport]({ORIGINAL_POST_URL}) adelantó una copa para {event_date}. En el snapshot configurado, la ficha de [Copa de ídolos de Weezy]({EPIC_WEEZY_EVENT_BR_URL}) aparece para {official_event.get('region', 'la región indicada')} en {event_modes}, de {event_time}. Verifica estos datos antes de publicar.”",
         "",
         "### Lo que ya aparece en la API — 0:17–0:39",
         "",
-        f"“La búsqueda exacta del set `Lil Wayne` devuelve {len(set_records)} objetos de Battle Royale: {type_counts.get('Atuendo / skin', 0)} skins, {type_counts.get('Accesorio mochilero', 0)} accesorios mochileros, {type_counts.get('Pico', 0)} picos, {type_counts.get('Emote', 0)} emotes, un emoticono, un ala delta, una pantalla de carga y una envoltura.”",
+        f"“La búsqueda exacta del set `Lil Wayne` devuelve {len(set_records)} objetos de Battle Royale. El desglose de esta ejecución es: {catalog_summary}.”",
         "",
-        "“Las dos skins se llaman `Weezy` y `Lil Wayne`. La skin Weezy tiene variantes de sombrero, gafas, camiseta sin mangas y reactividad; la segunda tiene variantes de gafas y reactividad.”",
+        f"“{outfit_voice} La API devuelve los metadatos y las variantes registradas en este snapshot; muestra únicamente los nombres y atributos que aparezcan en los datos.”",
         "",
         "### Festival — 0:39–0:50",
         "",
-        f"“El paquete también trae {len(tracks)} canciones de Festival: {', '.join(str(item.get('title')) for item in tracks)}. Además aparece `Tha Guitar` como instrumento de Festival. Son recursos catalogados; la API no significa por sí sola que ya estén a la venta.”",
+        f"“El paquete también trae {len(tracks)} canción(es) de Festival: {track_titles}. Además aparecen estos instrumentos relacionados: {instrument_names}. Son recursos catalogados; la API no significa por sí sola que ya estén a la venta.”",
         "",
         "### Torneo, puntuación y premios — 0:50–1:12",
         "",
-        "“La ficha del evento indica hasta 11 partidas. La puntuación es de 7 puntos por Victoria Royale, 4 por segundo lugar, 2 por tercero, 1 punto del cuarto al puesto 50 y 2 por cada eliminación. El desempate se resuelve por victorias, promedio de eliminaciones, promedio del desempate de colocación y tiempo promedio con vida.”",
+        f"“La ficha competitiva configurada indica hasta {public_event.get('matchCap', 'un número no indicado')} partidas. La puntuación configurada es: {score_text or 'no disponible'}. El desempate indicado es: {tiebreaker_text}.”",
         "",
-        "“El feed público del evento señala que el Top 700 recibe acceso a `Weezy` y `Weezy Board`, mientras que alcanzar 8 puntos entrega el emoticono `YM`. La página oficial describe la recompensa como acceso al lote Weezy; no la presentes como dinero ni como las dos skins completas.”",
+        f"“El feed público configurado señala {placement_prize} para el Top 700 y {points_prize} por puntos. Trátalo como un dato pendiente de revalidación y no lo presentes como dinero ni como las dos skins completas.”",
         "",
         "### Cierre responsable — 1:12–1:24",
         "",
-        "“Lo único que sigue pendiente es ver el reglamento específico publicado por Epic y comprobar cómo se reflejarán las recompensas en cada región. Para el video ya puedes afirmar que la copa está listada oficialmente, pero conviene decir que los premios concretos provienen del feed público del evento y pueden actualizarse antes de comenzar.”",
+        "“Antes de publicar, revalida la ficha de Epic, el reglamento específico, la región y el feed de premios. En este reporte, los cosméticos proceden de la API y los datos competitivos son un snapshot configurado que puede cambiar.”",
         "",
-        "## Datos confirmados para mostrar en pantalla",
+        "## Datos a mostrar en pantalla",
         "",
         "| Elemento | Estado | Texto recomendado en el video |",
         "|---|---|---|",
-        "| Teaser oficial | Confirmado por la cuenta Fortnite | “Teaser oficial de Fortnite” |",
-        "| Dos skins | Confirmadas como registros del catálogo | “Weezy” y “Lil Wayne” |",
-        "| 13 objetos BR | Confirmados por búsqueda exacta del set | “Set Lil Wayne: 13 objetos BR” |",
-        f"| {len(tracks)} canciones | Confirmadas por `/v2/cosmetics/tracks` | “Lollipop, A Milli (2023 Remix), 6 Foot 7 Foot” |",
-        "| Weezy Icon Cup | Listada en la ficha oficial de Competitivo | “Copa oficial: NAC, 12 de septiembre” |",
-        "| Horario NAC | 5:00 p. m.–8:00 p. m. | “Battle Royale y Zero Build” |",
-        "| Puntuación | Feed público del evento | “Victoria +7 / elim +2” |",
-        "| Premio Top 700 | Feed público del evento | “Weezy + Weezy Board” |",
-        "| Premio de 8 puntos | Feed público del evento | “YM” |",
-        "| Reglamento específico | No aparece identificado en la biblioteca al momento de revisar | Presentar la tabla como datos actuales del evento |",
+        f"| Teaser oficial | URL configurada; comprobaciones públicas: {public_check_summary} | “Teaser oficial de Fortnite” |",
+        f"| Atuendos catalogados | {len(outfits)} en esta ejecución | “{outfit_names}” |",
+        f"| Catálogo BR | {len(set_records)} registros; {catalog_summary} | “Set Lil Wayne” |",
+        f"| {len(tracks)} canciones | Registros devueltos por `/v2/cosmetics/tracks` | “{track_titles}” |",
+        f"| Weezy Icon Cup | Snapshot configurado; no se revalida automáticamente | “Copa indicada para {official_event.get('region', 'la región indicada')}” |",
+        f"| Horario configurado | {event_time} | “{event_modes}” |",
+        f"| Puntuación configurada | {score_text or 'no disponible'} | Revalidar antes de publicar |",
+        f"| Premio Top 700 | {placement_prize} | Revalidar antes de publicar |",
+        f"| Premio por puntos | {points_prize} | Revalidar antes de publicar |",
+        "| Reglamento específico | Estado pendiente de comprobación | No presentarlo como confirmado |",
         "",
         "## Orden visual recomendado",
         "",
-        "1. Mostrar el póster de la Weezy Icon Cup recibido del post comunitario.",
-        "2. Cortar a las dos imágenes de skin: primero `Weezy`, después `Lil Wayne`.",
-        "3. Mostrar rápidamente `Weezy Board`, `Weezy Boardbreaker`, `Young Money Stage`, `YM Burner` y `Tha Guitar`.",
-        "4. Mostrar las carátulas de `Lollipop`, `A Milli (2023 Remix)` y `6 Foot 7 Foot` como bloque de Festival.",
-        "5. Cerrar con una tarjeta textual fuera de las imágenes: “NAC · 12 sep · 5–8 p. m. · Top 700: Weezy + Weezy Board”.",
+        "1. Mostrar el póster de la Weezy Icon Cup si la descarga de la fuente pública fue válida.",
+        f"2. Cortar a los atuendos catalogados: {outfit_names}.",
+        f"3. Mostrar los primeros recursos del catálogo: {visual_names}.",
+        f"4. Mostrar las carátulas de Festival disponibles: {track_titles}.",
+        f"5. Cerrar con una tarjeta que indique “{official_event.get('region', 'región no indicada')} · {event_date} · {event_time}” y marque los premios como snapshot pendiente de revalidación.",
         "",
         "## Frases que conviene evitar",
         "",
-        "- “La skin será gratis para todos” — el premio está limitado al Top 700 según el feed consultado.",
-        "- “El ganador recibe las dos skins” — el premio identificado es `Weezy` más `Weezy Board`; `Lil Wayne` es otro registro del catálogo.",
-        "- “La copa empieza a las [hora] en todo el mundo” — 5:00–8:00 p. m. es el horario mostrado para NAC; otras regiones pueden tener otra hora local.",
-        "- “El reglamento ya está publicado” — la ficha oficial existe, pero no encontré una página específica de reglas Weezy en la biblioteca al momento de esta revisión.",
+        "- “La skin será gratis para todos” — no conviertas un premio configurado o pendiente de revalidación en una recompensa universal.",
+        f"- “El ganador recibe las dos skins” — el catálogo contiene {len(outfits)} atuendo(s), pero eso no determina el premio del torneo.",
+        f"- “La copa empieza a la misma hora en todo el mundo” — el snapshot solo indica {event_time} para {official_event.get('region', 'la región configurada')}.",
+        "- “El reglamento ya está publicado” — la existencia o el contenido del reglamento debe comprobarse en una fuente oficial vigente.",
         "",
         "## Fuentes consultadas",
         "",
         f"- [Post de FNcompReport]({ORIGINAL_POST_URL}) — anuncio comunitario de la copa.",
         f"- [Teaser oficial de Fortnite]({OFFICIAL_TEASER_URL}) — colaboración pública.",
         f"- [Ficha oficial de la Copa de ídolos de Weezy]({EPIC_WEEZY_EVENT_BR_URL}) — modo, fecha, requisitos, plataformas y regiones.",
-        f"- [Horario oficial NAC de la Copa de ídolos de Weezy]({EPIC_WEEZY_SCHEDULE_URL}) — sesión del 12 de septiembre, 5:00 p. m.–8:00 p. m. para las dos rondas.",
+        f"- [Horario oficial NAC de la Copa de ídolos de Weezy]({EPIC_WEEZY_SCHEDULE_URL}) — URL de referencia; el snapshot local indica {event_date}, {event_time}.",
         f"- [Ficha de Fortnite Tracker: Battle Royale]({TRACKER_WEEZY_BR_URL}) y [Zero Build]({TRACKER_WEEZY_ZB_URL}) — tabla pública de puntuación, límite de partidas y premios del feed del evento.",
-        f"- [Set Lil Wayne en Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/br/search/all?set=Lil%20Wayne&matchMethod=full&language=en) — 13 objetos BR.",
+        f"- [Set Lil Wayne en Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/br/search/all?set=Lil%20Wayne&matchMethod=full&language=en) — {len(set_records)} objetos BR en esta ejecución.",
         f"- [Canciones de Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/tracks?language=en) — carátulas y metadatos de Festival.",
-        f"- [Instrumentos de Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/instruments?language=en) — guitarra `Tha Guitar`.",
+        f"- [Instrumentos de Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/instruments?language=en) — {instrument_names}.",
         f"- [Item Shop Cups de Epic]({EPIC_ITEM_SHOP_CUPS_URL}) — marco general y reglas variables por copa.",
         f"- [Agenda competitiva oficial]({EPIC_COMPETITIVE_URL}) y [Rules Library]({EPIC_RULES_LIBRARY_URL}) — revisión de publicación y reglamento específico.",
         f"- [Beebom]({BEEBOM_URL}) — cobertura secundaria del teaser; no se usa para confirmar premios.",
@@ -311,6 +392,6 @@ def build_video_brief(
     timestamp = retrieved.strftime("%Y%m%dT%H%M%SZ")
     report_path = output_dir / f"{timestamp}-guion-video-weezy-icon-cup.md"
     snapshot_path = output_dir / f"{timestamp}-snapshot-guion-weezy-icon-cup.json"
-    report_path.write_text(report, encoding="utf-8")
-    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(report_path, report)
+    write_text_atomic(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
     return VideoBriefArtifacts(report_path, snapshot_path, tuple(probes))

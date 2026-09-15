@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 
 from .client import APIResult
+from .transport import write_text_atomic
 
 
 def _slug(value: str) -> str:
@@ -30,6 +31,6 @@ def save_result(result: APIResult, output_dir: Path, label: str) -> Path:
         "response": result.payload,
     }
     path = output_dir / filename
-    path.write_text(json.dumps(document, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_text_atomic(path, json.dumps(document, ensure_ascii=False, indent=2) + "\n")
     return path
 

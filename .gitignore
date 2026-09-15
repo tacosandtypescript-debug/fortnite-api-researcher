@@ -4,11 +4,22 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage/
+htmlcov/
 .venv/
 venv/
 dist/
 build/
 *.egg-info/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
 salidas/
 
 # Artefactos temporales de construcción y validación del storyboard

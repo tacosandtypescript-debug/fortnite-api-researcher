@@ -173,7 +173,16 @@ $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $outputPath -Encodi
 if (-not $NoSend) {
     Push-Location $projectRoot
     try {
-        & py -3 -m fortnite_research.cli send-file $outputPath --caption 'Diagnostico de senal Fortnite en Windows'
+        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+        $pythonArguments = @()
+        if (-not $pythonCommand) {
+            $pythonCommand = Get-Command py -ErrorAction SilentlyContinue
+            $pythonArguments = @('-3')
+        }
+        if (-not $pythonCommand) {
+            throw 'No se encontró Python. Activa el entorno virtual o instala Python 3.10+.'
+        }
+        & $pythonCommand.Source @pythonArguments -m fortnite_research.cli send-file $outputPath --caption 'Diagnostico de senal Fortnite en Windows'
         if ($LASTEXITCODE -ne 0) { throw 'El envio por Telegram no fue confirmado' }
     } finally {
         Pop-Location

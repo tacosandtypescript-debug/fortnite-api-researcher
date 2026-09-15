@@ -14,15 +14,20 @@ import re
 import tempfile
 import unicodedata
 import urllib.parse
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from .client import FortniteAPIClient, FortniteAPIError
+from .transport import (
+    HTTPFetchError,
+    ResponseTooLargeError,
+    atomic_zipfile,
+    fetch,
+    write_bytes_atomic,
+    write_text_atomic,
+)
 
 
 @dataclass(frozen=True)
@@ -391,19 +396,40 @@ def _banner_matches(value: Any, keywords: tuple[str, ...]) -> list[dict[str, Any
 
 
 def _public_status(url: str, timeout: float) -> dict[str, Any]:
-    request = Request(
-        url,
-        headers={"Accept": "application/json", "User-Agent": "fortnite-api-researcher/0.1.0"},
-        method="GET",
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            response.read(64)
-            return {"url": url, "httpStatus": int(response.status), "available": True}
-    except HTTPError as exc:
-        return {"url": url, "httpStatus": exc.code, "available": False}
-    except (URLError, TimeoutError):
-        return {"url": url, "httpStatus": None, "available": False, "errorType": "transport"}
+        response = fetch(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "fortnite-api-researcher/0.1.0",
+            },
+            timeout=timeout,
+            max_bytes=1_000_000,
+            retries=2,
+        )
+        return {
+            "url": url,
+            "httpStatus": response.status_code,
+            "available": 200 <= response.status_code < 300,
+        }
+    except HTTPFetchError as exc:
+        if exc.status_code is not None:
+            return {"url": url, "httpStatus": exc.status_code, "available": False}
+        return {
+            "url": url,
+            "httpStatus": None,
+            "available": False,
+            "errorType": "transport",
+            "detail": str(exc)[:160],
+        }
+    except ValueError as exc:
+        return {
+            "url": url,
+            "httpStatus": None,
+            "available": False,
+            "errorType": "invalid_url",
+            "detail": str(exc)[:160],
+        }
 
 
 def _image_info(content: bytes, content_type: str | None) -> dict[str, Any]:
@@ -422,31 +448,54 @@ def _image_info(content: bytes, content_type: str | None) -> dict[str, Any]:
 
 
 def _download_image(url: str, destination: Path, timeout: float) -> dict[str, Any]:
-    request = Request(
-        url,
-        headers={"Accept": "image/avif,image/webp,image/png,image/jpeg,*/*", "User-Agent": "fortnite-api-researcher/0.1.0"},
-        method="GET",
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            content_type = response.headers.get("Content-Type")
-            content = response.read()
-    except HTTPError as exc:
-        return {"url": url, "downloaded": False, "httpStatus": exc.code, "errorType": "http"}
-    except (URLError, TimeoutError) as exc:
-        detail = getattr(exc, "reason", str(exc))
-        return {"url": url, "downloaded": False, "httpStatus": None, "errorType": "transport", "detail": str(detail)[:120]}
+        response = fetch(
+            url,
+            headers={
+                "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*",
+                "User-Agent": "fortnite-api-researcher/0.1.0",
+            },
+            timeout=timeout,
+            max_bytes=25_000_000,
+            retries=2,
+        )
+    except HTTPFetchError as exc:
+        if isinstance(exc, ResponseTooLargeError):
+            return {
+                "url": url,
+                "downloaded": False,
+                "httpStatus": exc.status_code,
+                "errorType": "size_or_empty",
+            }
+        detail = str(exc)
+        return {
+            "url": url,
+            "downloaded": False,
+            "httpStatus": exc.status_code,
+            "errorType": "http" if exc.status_code is not None else "transport",
+            "detail": detail[:120],
+        }
+    except ValueError as exc:
+        return {
+            "url": url,
+            "downloaded": False,
+            "httpStatus": None,
+            "errorType": "invalid_url",
+            "detail": str(exc)[:120],
+        }
+    content_type = response.headers.get("Content-Type")
+    content = response.body
+    status = response.status_code
     if not content or len(content) > 25_000_000:
-        return {"url": url, "downloaded": False, "httpStatus": 200, "errorType": "size_or_empty"}
+        return {"url": url, "downloaded": False, "httpStatus": status, "errorType": "size_or_empty"}
     info = _image_info(content, content_type)
     if not info["valid"]:
-        return {"url": url, "downloaded": False, "httpStatus": 200, "errorType": "not_an_image"}
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(content)
+        return {"url": url, "downloaded": False, "httpStatus": status, "errorType": "not_an_image"}
+    write_bytes_atomic(destination, content)
     return {
         "url": url,
         "downloaded": True,
-        "httpStatus": 200,
+        "httpStatus": status,
         "contentType": content_type,
         "bytes": len(content),
         "sha256": hashlib.sha256(content).hexdigest(),
@@ -479,11 +528,24 @@ def _build_report(
     total_records = sum(len(item["records"]) for item in target_results)
     total_assets = sum(1 for item in asset_entries if item.get("downloaded"))
     total_bytes = sum(int(item.get("bytes", 0)) for item in asset_entries if item.get("downloaded"))
+    target_years = sorted(
+        {
+            str(item["target"].date)[:4]
+            for item in target_results
+            if item["target"].date
+        }
+    )
+    video_record_count = sum(
+        1
+        for item in target_results
+        for record in item["records"]
+        if record.get("video")
+    )
     lines = [
         "# Investigación de calendario, skins, imágenes, banners y vídeos de Fortnite",
         "",
         f"- Consulta ejecutada (UTC): {retrieved_at}",
-        "- Año interpretado: 2026 porque la consulta se ejecutó el 9 de septiembre de 2026.",
+        f"- Años de las fechas objetivo configuradas: {', '.join(target_years) or 'no indicados'}.",
         "- Fuente de datos principal: Fortnite-API.com, API comunitaria no oficial.",
         "- Documentación de endpoints: https://dash.fortnite-api.com/endpoints/cosmetics.",
         "- Regla de evidencia: una coincidencia en la API confirma que el recurso existe en el catálogo; no confirma por sí sola una fecha futura de tienda.",
@@ -494,7 +556,7 @@ def _build_report(
         f"- Imágenes originales CDN descargadas y validadas: **{total_assets}**.",
         f"- Tamaño total de imágenes dentro del ZIP: **{total_bytes:,} bytes**.",
         f"- Fecha del feed de tienda consultado: {shop_date or 'no disponible'}.",
-        "- Ningún registro cosmético consultado expuso un vídeo directo en su campo video.",
+        f"- Registros cosméticos que expusieron un vídeo directo en su campo video: {video_record_count}.",
         "- /v1/banners respondió correctamente, pero las coincidencias por estos nombres fueron banners de perfil: no se encontró un banner promocional de tienda asociado a la lista.",
         "",
         "## Resultado por fecha",
@@ -771,7 +833,7 @@ def build_schedule_package(
         timestamp_label = retrieved_at.strftime("%Y%m%dT%H%M%SZ")
         report_path = output_dir / f"{timestamp_label}-informe-calendario-fortnite.md"
         archive_path = output_dir / f"{timestamp_label}-recursos-calendario-fortnite.zip"
-        report_path.write_text(report, encoding="utf-8")
+        write_text_atomic(report_path, report)
 
         target_counts = {
             item["target"].key: len(item["records"])
@@ -782,7 +844,13 @@ def build_schedule_package(
                 "source": "Fortnite-API.com",
                 "retrievedAt": retrieved_iso,
                 "language": language,
-                "dateAssumption": 2026,
+                "targetDateYears": sorted(
+                    {
+                        str(target.date)[:4]
+                        for target in TARGETS
+                        if target.date
+                    }
+                ),
             },
             "apiProbes": api_probes,
             "targets": [
@@ -812,18 +880,10 @@ def build_schedule_package(
         }
         snapshot_path = staging_dir / "api_snapshot.json"
         manifest_path = staging_dir / "manifest.json"
-        snapshot_path.write_text(
-            json.dumps(api_snapshot, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        manifest_path.write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        with zipfile.ZipFile(
+        write_text_atomic(snapshot_path, json.dumps(api_snapshot, ensure_ascii=False, indent=2) + "\n")
+        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        with atomic_zipfile(
             archive_path,
-            mode="w",
-            compression=zipfile.ZIP_DEFLATED,
             compresslevel=6,
         ) as archive:
             archive.write(report_path, arcname="INFORME-calendario-fortnite.md")

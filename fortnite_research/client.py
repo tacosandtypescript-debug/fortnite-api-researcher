@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
-from typing import Any, Mapping
-from urllib.error import HTTPError, URLError
+from typing import Any, Iterable, Mapping
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+
+from .transport import HTTPFetchError, fetch, validate_https_url
 
 
 class FortniteAPIError(RuntimeError):
@@ -27,10 +28,38 @@ class APIResult:
 
 
 class FortniteAPIClient:
-    def __init__(self, base_url: str = "https://fortnite-api.com", api_key: str | None = None, timeout: float = 30):
+    def __init__(
+        self,
+        base_url: str = "https://fortnite-api.com",
+        api_key: str | None = None,
+        timeout: float = 30,
+        trusted_api_hosts: Iterable[str] | None = None,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        if timeout <= 0 or not math.isfinite(timeout):
+            raise ValueError("timeout debe ser mayor que cero y finito")
         self.timeout = timeout
+        self.api_host = validate_https_url(self.base_url)
+        trusted = (
+            trusted_api_hosts
+            if trusted_api_hosts is not None
+            else ("fortnite-api.com", "www.fortnite-api.com")
+        )
+        self.trusted_api_hosts = frozenset(
+            str(host).strip().casefold()
+            for host in trusted
+            if str(host).strip()
+        )
+        if self.api_key and self.api_host not in self.trusted_api_hosts:
+            raise ValueError(
+                "La API key solo se puede enviar a un hostname confiable"
+            )
+        self._allowed_hosts = (
+            self.trusted_api_hosts
+            if self.api_key
+            else frozenset({self.api_host})
+        )
 
     def get(self, path: str, params: Mapping[str, str] | None = None) -> APIResult:
         if not path.startswith("/") or path.startswith("//"):
@@ -45,23 +74,30 @@ class FortniteAPIClient:
         }
         if self.api_key:
             headers["x-api-key"] = self.api_key
-        request = Request(url, headers=headers, method="GET")
         try:
-            with urlopen(request, timeout=self.timeout) as response:
-                status_code = int(response.status)
-                body = response.read()
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")[:1000]
-            raise FortniteAPIError(f"La API respondió HTTP {exc.code}: {detail}", status_code=exc.code) from exc
-        except URLError as exc:
-            raise FortniteAPIError(f"No se pudo conectar con Fortnite-API.com: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise FortniteAPIError("La consulta a Fortnite-API.com agotó el tiempo de espera") from exc
+            response = fetch(
+                url,
+                headers=headers,
+                timeout=self.timeout,
+                max_bytes=10_000_000,
+                retries=2,
+                allowed_hosts=self._allowed_hosts,
+            )
+        except HTTPFetchError as exc:
+            raise FortniteAPIError(
+                f"La API no pudo completar la consulta: {exc}",
+                status_code=exc.status_code,
+            ) from exc
         try:
-            payload = json.loads(body.decode("utf-8"))
+            payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FortniteAPIError("La API devolvió una respuesta que no es JSON válido") from exc
-        return APIResult(path=path, params=query, status_code=status_code, payload=payload)
+        return APIResult(
+            path=path,
+            params=query,
+            status_code=response.status_code,
+            payload=payload,
+        )
 
     def shop(self, language: str = "en") -> APIResult:
         return self.get("/v2/shop", {"language": language})

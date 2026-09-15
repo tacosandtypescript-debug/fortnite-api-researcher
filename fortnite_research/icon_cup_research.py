@@ -20,16 +20,21 @@ import mimetypes
 import shutil
 import tempfile
 import urllib.parse
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from .client import FortniteAPIClient, FortniteAPIError
 from .schedule_assets import _data, _download_image, _image_info, _slug
+from .transport import (
+    HTTPFetchError,
+    ResponseTooLargeError,
+    atomic_zipfile,
+    fetch,
+    write_bytes_atomic,
+    write_text_atomic,
+)
 
 
 ORIGINAL_POST_URL = "https://x.com/fncompreport/status/2098080878320619883?s=46"
@@ -73,34 +78,53 @@ class IconCupResearchArtifacts:
 
 def _safe_public_json(url: str, timeout: float) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Lee un espejo público de X y devuelve solo un estado seguro para el reporte."""
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/json",
-            "User-Agent": "fortnite-api-researcher/0.1.0",
-        },
-        method="GET",
-    )
     try:
-        with urlopen(request, timeout=timeout) as response:
-            body = response.read()
-            status = int(response.status)
-    except HTTPError as exc:
-        return {"url": url, "httpStatus": exc.code, "available": False, "errorType": "http"}, None
-    except (URLError, TimeoutError) as exc:
-        detail = getattr(exc, "reason", str(exc))
+        response = fetch(
+            url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "fortnite-api-researcher/0.1.0",
+            },
+            timeout=timeout,
+            max_bytes=5_000_000,
+            retries=2,
+        )
+    except HTTPFetchError as exc:
+        if isinstance(exc, ResponseTooLargeError):
+            return {
+                "url": url,
+                "httpStatus": exc.status_code,
+                "available": False,
+                "errorType": "size_or_empty",
+            }, None
+        detail = str(exc)
+        error_type = "http" if exc.status_code is not None else "transport"
+        return {
+            "url": url,
+            "httpStatus": exc.status_code,
+            "available": False,
+            "errorType": error_type,
+            "detail": detail[:160],
+        }, None
+    except ValueError as exc:
         return {
             "url": url,
             "httpStatus": None,
             "available": False,
-            "errorType": "transport",
-            "detail": str(detail)[:160],
+            "errorType": "invalid_url",
+            "detail": str(exc)[:160],
         }, None
+    body = response.body
+    status = response.status_code
     try:
         payload = json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return {"url": url, "httpStatus": status, "available": False, "errorType": "not_json"}, None
-    return {"url": url, "httpStatus": status, "available": True}, payload if isinstance(payload, dict) else None
+    return {
+        "url": url,
+        "httpStatus": status,
+        "available": 200 <= status < 300 and isinstance(payload, dict),
+    }, payload if isinstance(payload, dict) else None
 
 
 def _tweet_payload(payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -331,27 +355,42 @@ def _download_binary(
 ) -> dict[str, Any]:
     """Descarga bytes originales y valida el tipo por firma, no solo por extensión."""
     accept = "video/mp4,image/jpeg,image/png,image/webp,image/*,*/*" if expected in {"image", "video"} else "*/*"
-    request = Request(
-        url,
-        headers={"Accept": accept, "User-Agent": "fortnite-api-researcher/0.1.0"},
-        method="GET",
-    )
+    headers = {"Accept": accept, "User-Agent": "fortnite-api-researcher/0.1.0"}
     try:
-        with urlopen(request, timeout=timeout) as response:
-            content_type = response.headers.get("Content-Type")
-            content = response.read(max_bytes + 1)
-            status = int(response.status)
-    except HTTPError as exc:
-        return {"url": url, "downloaded": False, "httpStatus": exc.code, "errorType": "http"}
-    except (URLError, TimeoutError) as exc:
-        detail = getattr(exc, "reason", str(exc))
+        response = fetch(
+            url,
+            headers=headers,
+            timeout=timeout,
+            max_bytes=max_bytes,
+            retries=2,
+        )
+    except HTTPFetchError as exc:
+        if isinstance(exc, ResponseTooLargeError):
+            return {
+                "url": url,
+                "downloaded": False,
+                "httpStatus": exc.status_code,
+                "errorType": "size_or_empty",
+            }
+        detail = str(exc)
+        return {
+            "url": url,
+            "downloaded": False,
+            "httpStatus": exc.status_code,
+            "errorType": "http" if exc.status_code is not None else "transport",
+            "detail": detail[:160],
+        }
+    except ValueError as exc:
         return {
             "url": url,
             "downloaded": False,
             "httpStatus": None,
-            "errorType": "transport",
-            "detail": str(detail)[:160],
+            "errorType": "invalid_url",
+            "detail": str(exc)[:160],
         }
+    content_type = response.headers.get("Content-Type")
+    content = response.body
+    status = response.status_code
     if not content or len(content) > max_bytes:
         return {"url": url, "downloaded": False, "httpStatus": status, "errorType": "size_or_empty"}
 
@@ -370,8 +409,7 @@ def _download_binary(
     else:
         metadata = {"format": content_type or "unknown"}
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(content)
+    write_bytes_atomic(destination, content)
     return {
         "url": url,
         "downloaded": True,
@@ -398,7 +436,7 @@ def _copy_reference_image(source: Path, staging_dir: Path) -> dict[str, Any]:
     relative = Path("assets") / "referencia" / source.name
     destination = staging_dir / relative
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_bytes(content)
+    write_bytes_atomic(destination, content)
     return {
         "kind": "user_reference",
         "sourceName": source.name,
@@ -450,6 +488,34 @@ def _build_report(
     post_date = (post or {}).get("createdAt") or "No disponible"
     teaser_date = (teaser_post or {}).get("createdAt") or "No disponible"
     teaser_videos = (teaser_post or {}).get("videos") or []
+    added_values = sorted(
+        {
+            str(record.get("added"))
+            for record in set_records
+            if record.get("added")
+        }
+    )
+    added_text = ", ".join(added_values) or "no indicado"
+    outfit_records = [
+        record for record in set_records if _record_type(record) == "Outfit"
+    ]
+    outfit_names = ", ".join(
+        str(record.get("name") or "sin nombre") for record in outfit_records
+    ) or "ninguno"
+    outfit_note = (
+        f"- **Atuendos encontrados:** {len(outfit_records)} ({outfit_names})."
+        if outfit_records
+        else "- **No se devolvieron atuendos en la búsqueda exacta del set.**"
+    )
+    record_type_counts: dict[str, int] = {}
+    for record in set_records:
+        record_type = _record_type(record)
+        record_type_counts[record_type] = record_type_counts.get(record_type, 0) + 1
+    record_type_text = ", ".join(
+        f"{record_type}: {count}"
+        for record_type, count in sorted(record_type_counts.items())
+    ) or "sin tipos"
+    snapshot_date = retrieved_at[:10]
 
     lines = [
         "# Investigación: Weezy Icon Cup",
@@ -460,7 +526,7 @@ def _build_report(
         "",
         "## Veredicto ejecutivo",
         "",
-        "**La publicación es compatible con una colaboración de Lil Wayne que ya empezó a entrar en el catálogo de Fortnite, pero el anuncio del torneo todavía no trae todos los datos competitivos verificables.** La API devolvió cinco cosméticos del set `Lil Wayne`, todos añadidos el 10 de septiembre de 2026, y la novedad contiene los mismos registros. No devolvió un atuendo dentro de ese set en esta consulta.",
+        f"**La publicación es compatible con una colaboración de Lil Wayne que ya empezó a entrar en el catálogo de Fortnite, pero el anuncio del torneo todavía no trae todos los datos competitivos verificables.** La API devolvió {len(set_records)} cosméticos del set `Lil Wayne`, con fechas `added` observadas: {added_text}. La novedad contiene {len(new_records)} coincidencia(s) del mismo set en el snapshot.",
         "",
         "La identificación de “Weezy” con Lil Wayne tiene confianza alta: la publicación utiliza el nombre artístico, el catálogo de la API etiqueta el set como `Lil Wayne` y existe un teaser de la cuenta oficial de Fortnite. La existencia exacta de la copa, su hora, la puntuación y sus recompensas no deben darse por cerradas hasta que aparezca la ficha en la pestaña **Competir** o su reglamento oficial.",
         "",
@@ -468,13 +534,13 @@ def _build_report(
         "",
         f"- Texto recuperado del espejo público de X: `{post_text.replace(chr(10), ' / ')}`.",
         f"- Fecha de publicación reportada por el espejo: `{post_date}`.",
-        "- La imagen adjunta muestra a Lil Wayne y el rótulo “WEEZY ICON CUP”, con los modos Solo Battle Royale y Solo Zero Build y la fecha del sábado 12 de septiembre.",
+        "- La imagen adjunta identifica a Lil Wayne y el rótulo “WEEZY ICON CUP”, además de texto sobre modos y fecha; se conserva como evidencia comunitaria, no como reglamento de Epic.",
         "- El post pertenece a `@FNcompReport`; se conserva como reporte comunitario y no como una página oficial de reglas de Epic.",
         f"- La imagen original recibida se incluye byte por byte en el ZIP: {reference_info.get('width') if reference_info else 'n/d'} × {reference_info.get('height') if reference_info else 'n/d'} píxeles, {reference_info.get('bytes', 0):,} bytes.",
         "",
         "## Lo que sí encontró Fortnite-API.com",
         "",
-        f"- **Set `Lil Wayne`: {len(set_records)} registros.** Todos tienen `added = 2026-09-10T16:00:38Z`, introducción en Chapter 7, Season 4 y rareza Icon Series.",
+        f"- **Set `Lil Wayne`: {len(set_records)} registros.** Valores `added` observados: {added_text}. La introducción y rareza se conservan en la tabla según cada registro; no se asume que sean idénticas si la API cambia.",
         f"- **Novedades:** `/v2/cosmetics/new` devolvió {api_snapshot.get('newBrCount', 'n/d')} entradas de Battle Royale; dentro de ellas volvieron a aparecer {len(new_records)} coincidencias del set.",
         f"- **Tienda actual:** `/v2/shop` respondió {_status(next((q for q in queries if q.get('name') == 'shop'), {}))}; las coincidencias de Lil Wayne en el feed actual fueron {len(shop_matches)}.",
         f"- **Noticias:** `/v2/news/br` respondió {_status(next((q for q in queries if q.get('name') == 'news'), {}))}; no hay un mensaje de noticias que nombre directamente a Weezy o Lil Wayne en este snapshot ({len(news_matches)} coincidencias textuales).",
@@ -496,25 +562,25 @@ def _build_report(
     lines.extend(
         [
             "",
-            "### Lectura de esos cinco registros",
+            f"### Lectura de los {len(set_records)} registros devueltos",
             "",
-            "- `Tha Guitar` aparece dos veces porque la API lo clasifica como **Back Bling** y como **Pickaxe**.",
-            "- `Young Money Stage` es un **Glider**.",
-            "- `Weezy's Pose` es una **Loading Screen** y su descripción contiene el crédito artístico de Ryan Smallman.",
-            "- `YM Burner` es una **Wrap**.",
-            "- **No se devolvió un `outfit` en la búsqueda exacta del set `Lil Wayne`.** Eso solo describe el estado del catálogo consultado; no permite concluir que el atuendo no exista en archivos internos o que no vaya a llegar después.",
+            f"- Tipos observados en el set: {record_type_text}.",
+            f"- Atuendos observados: {outfit_names}.",
+            "- Las variantes, descripciones e IDs deben leerse desde la tabla de esta ejecución; no se copian nombres de un snapshot anterior.",
+            "- La presencia en el catálogo no demuestra disponibilidad actual en tienda ni que un objeto sea premio del torneo.",
+            outfit_note,
             "",
             "## Relación con la copa y las recompensas",
             "",
             f"La {_md_link('página oficial de Item Shop Cups de Epic', EPIC_ITEM_SHOP_CUPS_URL)} explica que son torneos especiales de un día, que cada copa puede tener un modo y tamaño de equipo propio y que los premios cosméticos cambian según la copa. También indica como requisitos generales tener 13 años o más y una cuenta de nivel 50 o superior; el reglamento específico de cada copa es el que manda.",
             "",
-            f"En la {_md_link('biblioteca oficial de reglas', EPIC_RULES_LIBRARY_URL)} consultada el 10 de septiembre de 2026 aparecen reglamentos de otros eventos de 2026, pero no aparece todavía un documento identificable como “Weezy Icon Cup”. Por lo tanto, no asigno a esta copa una hora, límite de puntos, región, número de partidas o premio concreto a partir de ejemplos de otras Icon Cups.",
+            f"En la {_md_link('biblioteca oficial de reglas', EPIC_RULES_LIBRARY_URL)} consultada el {snapshot_date} aparecen reglamentos de otros eventos, pero no aparece todavía un documento identificable como “Weezy Icon Cup”. Por lo tanto, no asigno a esta copa una hora, límite de puntos, región, número de partidas o premio concreto a partir de ejemplos de otras Icon Cups.",
             "",
             "Como referencia de precedentes, otras Icon Cups han usado la competición para entregar acceso anticipado o cosméticos del creador; ese patrón hace plausible que la Weezy Cup esté ligada a cosméticos de Lil Wayne, pero **no confirma cuál será el corte de puntos ni el premio de esta edición**.",
             "",
             "## Teaser oficial y grado de confirmación",
             "",
-            f"- La cuenta oficial {_md_link('@Fortnite en X', OFFICIAL_TEASER_URL)} publicó un teaser el 9 de septiembre de 2026; el espejo público lo fecha en `{teaser_date}` y reporta {len(teaser_videos)} recurso(s) de vídeo.",
+            f"- La cuenta oficial {_md_link('@Fortnite en X', OFFICIAL_TEASER_URL)} tiene un teaser; el espejo público lo fecha en `{teaser_date}` y reporta {len(teaser_videos)} recurso(s) de vídeo.",
             "- El texto visible del post oficial es un mensaje críptico de bienvenida; la identificación de la voz como Lil Wayne y la frase promocional de “Weezy F. Baby” están descritas por cobertura secundaria, no por el texto plano del post.",
             f"- {_md_link('Beebom', BEEBOM_URL)} describe ese teaser de nueve segundos y lo interpreta como la llegada de Lil Wayne a Fortnite. Es una corroboración fuerte, pero sigue siendo una fuente periodística secundaria.",
             "- La combinación de teaser oficial + set `Lil Wayne` recién añadido en la API hace que la lectura Lil Wayne/Weezy sea de **confianza alta**.",
@@ -524,10 +590,10 @@ def _build_report(
             "| Dato | Estado | Por qué |",
             "|---|---|---|",
             "| Nombre “Weezy” = Lil Wayne | Alto | Set `Lil Wayne` en la API y teaser oficial corroborado por cobertura |",
-            "| Existencia de una copa el sábado 12 | Medio-alto | Texto e imagen del reporte; falta la ficha oficial de evento |",
+            "| Existencia de una copa indicada en el post | Medio-alto | Texto e imagen del reporte; falta la ficha oficial de evento |",
             "| Solo Battle Royale y Solo Zero Build | Medio-alto | Está escrito en la publicación, pero falta el reglamento de Epic |",
-            "| Fecha 12 de septiembre | Medio-alto | Está escrita en el reporte; no se encontró un horario oficial publicado |",
-            "| Atuendo de Lil Wayne en el set API | No confirmado | La consulta exacta del set devolvió 5 elementos y ninguno es `outfit` |",
+            "| Fecha mostrada en el post | Medio-alto | Está escrita en el reporte; no se encontró un horario oficial publicado |",
+            f"| Atuendos en el set API | {len(outfit_records)} encontrados | La consulta exacta del set devolvió {len(set_records)} elemento(s) |",
             "| Premio de la copa | Desconocido | No apareció en la API ni en el reglamento oficial indexado |",
             "| Hora, regiones, duración, puntos y partidas | Desconocido | Fortnite-API.com no expone un endpoint público de torneos |",
             "| Disponibilidad en tienda y fecha de venta | Desconocido | `/v2/shop` no mostró coincidencias en el snapshot |",
@@ -561,7 +627,7 @@ def _build_report(
             "",
             f"- Descargas válidas: **{len(successful_assets)}**; fallidas: **{len(failed_assets)}**; bytes originales: **{sum(int(item.get('bytes', 0)) for item in successful_assets):,}**.",
             "- Se conserva la imagen adjunta del usuario sin recorte, conversión ni reescalado.",
-            "- Se incluyen la imagen original del post, el teaser oficial de Fortnite en MP4 si la descarga fue aceptada, su miniatura y las imágenes CDN que la API devolvió para los cinco registros de Lil Wayne.",
+            f"- Se incluyen la imagen original del post, el teaser oficial de Fortnite en MP4 si la descarga fue aceptada, su miniatura y las imágenes CDN que la API devolvió para los {len(set_records)} registros de Lil Wayne.",
             "- `api_snapshot.json` conserva las respuestas enfocadas y los resúmenes de estado sin API key, token de Telegram ni chat ID.",
             "- `manifest.json` contiene bytes, formato, dimensiones y SHA-256 para que puedas comprobar que Telegram recibió documentos originales.",
             "",
@@ -576,7 +642,7 @@ def _build_report(
             "",
             "## Conclusión operativa",
             "",
-            "La pista ya dejó de ser solo una imagen: Fortnite-API.com tiene cinco objetos nuevos dentro del set `Lil Wayne`, con nombres y URLs de imágenes reales. La API todavía no ofrece la ficha del torneo ni el atuendo, y la fuente oficial de reglas aún no muestra un reglamento Weezy identificable. El siguiente punto de verificación es la pestaña **Competir** del juego y la biblioteca de reglas de Epic el 12 de septiembre; hasta entonces, trata premios y horarios circulados por cuentas de filtraciones como provisionales.",
+            f"La pista ya dejó de ser solo una imagen: Fortnite-API.com tiene {len(set_records)} objeto(s) dentro del set `Lil Wayne`, con nombres y URLs de imágenes reales. La API todavía no ofrece la ficha completa del torneo, y la fuente oficial de reglas aún no muestra un reglamento Weezy identificable. El siguiente punto de verificación es la pestaña **Competir** del juego y la biblioteca de reglas de Epic; hasta entonces, trata premios y horarios circulados por cuentas de filtraciones como provisionales.",
             "",
         ]
     )
@@ -742,7 +808,7 @@ def build_icon_cup_research_package(
         timestamp_label = retrieved_at.strftime("%Y%m%dT%H%M%SZ")
         report_path = output_dir / f"{timestamp_label}-investigacion-weezy-icon-cup.md"
         archive_path = output_dir / f"{timestamp_label}-recursos-weezy-icon-cup.zip"
-        report_path.write_text(report, encoding="utf-8")
+        write_text_atomic(report_path, report)
 
         manifest = {
             "generatedAt": retrieved_iso,
@@ -754,10 +820,10 @@ def build_icon_cup_research_package(
         }
         snapshot_path = staging_dir / "api_snapshot.json"
         manifest_path = staging_dir / "manifest.json"
-        snapshot_path.write_text(json.dumps(api_snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        write_text_atomic(snapshot_path, json.dumps(api_snapshot, ensure_ascii=False, indent=2) + "\n")
+        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
 
-        with zipfile.ZipFile(archive_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        with atomic_zipfile(archive_path, compresslevel=6) as archive:
             archive.write(report_path, arcname="INFORME-weezy-icon-cup.md")
             archive.write(manifest_path, arcname="manifest.json")
             archive.write(snapshot_path, arcname="api_snapshot.json")
