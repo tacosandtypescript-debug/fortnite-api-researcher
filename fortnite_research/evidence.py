@@ -20,7 +20,10 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 # Estados HTTP que sí permiten afirmar que una ruta no está publicada.
-NOT_FOUND_STATUS = frozenset({404, 410})
+NOT_FOUND_STATUS = frozenset({404})
+# 410 Gone: la ruta existió y la retiraron. No es lo mismo que "no existe":
+# Fortnite-API responde 410 en /v1/aes e indica que hay una ruta nueva.
+RETIRED_STATUS = frozenset({410})
 # Estados que significan «no puedo concluir»: credenciales, límite o servidor.
 CREDENTIAL_STATUS = frozenset({401, 403, 407})
 RATE_LIMIT_STATUS = frozenset({429})
@@ -67,6 +70,8 @@ def probe_status_kind(status: Any) -> str:
         return "ok"
     if code in NOT_FOUND_STATUS:
         return "not_found"
+    if code in RETIRED_STATUS:
+        return "retired"
     if code in CREDENTIAL_STATUS:
         return "credentials"
     if code in RATE_LIMIT_STATUS:
@@ -80,12 +85,14 @@ def probe_interpretation(
     probe: Mapping[str, Any],
     *,
     not_found: str,
+    retired: str = "",
     unknown: str = "No concluyente",
 ) -> str:
     """Explica un sondeo fallido sin confundir «no existe» con «no lo sé».
 
-    Solo un 404/410 se interpreta como ausencia de ruta. Un 401/403, un 429 o un
-    5xx son resultados no concluyentes y así deben aparecer en el informe: un
+    Solo un 404 se interpreta como ausencia de ruta. Un 410 significa que la
+    ruta existió y fue retirada (Fortnite-API lo usa para indicar que hay una
+    ruta nueva), y un 401/403, 429 o 5xx son resultados no concluyentes: un
     límite de peticiones publicado como «ruta no publicada» es una conclusión
     falsa.
     """
@@ -93,6 +100,11 @@ def probe_interpretation(
     kind = probe_status_kind(status)
     if kind == "not_found":
         return not_found
+    if kind == "retired":
+        return retired or (
+            f"Ruta retirada por la API (HTTP {status}); consulta la documentación "
+            "para localizar la equivalente"
+        )
     if kind == "credentials":
         return (
             f"Requiere credenciales o permisos (HTTP {status}); "

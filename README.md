@@ -72,6 +72,13 @@ python -m fortnite_research cosmetic-search --name Jonesy --match-method contain
 # Consultar una ruta documentada directamente
 python -m fortnite_research get /v1/playlists --param language=es
 
+# Volcar el catálogo completo de Battle Royale (respuesta grande: sube el límite)
+python -m fortnite_research get /v2/cosmetics/br --max-mb 60 --param language=es
+
+# Claves AES del build actual (la ruta vigente es /v2/aes; /v1/aes está retirada)
+python -m fortnite_research aes
+python -m fortnite_research aes --key-format base64
+
 # Buscar rutas de servidores/regiones y medir NA-East, NA-Central y NA-West
 python -m fortnite_research servers
 
@@ -104,6 +111,35 @@ de otro equipo. Para herramientas externas, usa su ruta local explícita.
 Las tres invocaciones son equivalentes: `python -m fortnite_research`,
 `python -m fortnite_research.cli` y el script de consola `fortnite-research`
 (instalado por `pip install -e .`).
+
+## Qué expone la API (y qué no)
+
+Comprobado contra `https://fortnite-api.com` con este mismo cliente:
+
+| Ruta | Respuesta | Contenido |
+|---|---|---|
+| `/v2/aes` | 200 | claves AES: `build`, `mainKey` y `dynamicKeys` (pak, guid y clave) |
+| `/v2/shop` | 200 | tienda actual (`hash`, `date`, `entries`) |
+| `/v2/cosmetics/new` | 200 | altas del catálogo (`build`, `previousBuild`, `lastAdditions`) |
+| `/v2/cosmetics/br` | 200 | **catálogo completo de BR** (respuesta voluminosa, ver `--max-mb`) |
+| `/v2/cosmetics/tracks` · `instruments` · `cars` | 200 | Festival (canciones, instrumentos) y coches |
+| `/v1/playlists` · `/v1/map` · `/v1/banners` | 200 | listas, POIs e imágenes, banners |
+| `/v2/news/br` · `/v2/news/stw` | 200 | noticias y mensajes de Salvar el Mundo |
+| `/v2/creatorcode?name=...` | 200 / 400 | requiere el parámetro `name` |
+| `/v1/stats/br/v2` | 401 | requiere `FORTNITE_API_KEY` |
+| `/v1/events` · `/v2/events` · `/v1/tournaments` · `/v2/tournaments` | **404** | la API **no publica torneos ni eventos** |
+| `/v1/servers` · `/v1/regions` · `/v1/status` | **404** | sin lista de servidores físicos por ciudad |
+| `/v1/aes` · `/v1/creatorcode` · `/v1/cosmetics/br/new` | **410** | retiradas: existen rutas nuevas (`/v2/...`) |
+
+Dos consecuencias prácticas:
+
+- **Los torneos no están en la API.** No es un fallo del proyecto: por eso
+  `icon-cup-research` y `deep-icon-cup-research` reconstruyen el torneo a partir
+  de cosméticos, noticias y publicaciones públicas, y por eso el diagnóstico
+  distingue 404 (no publicada) de 410 (retirada) en lugar de mezclarlos.
+- **El catálogo completo necesita margen.** El cliente lee hasta 32 MB por
+  respuesta (antes 10 MB, que hacía fallar `/v2/cosmetics/br`); para volcados
+  mayores usa `--max-mb` en `get` y en `cosmetic-search`.
 
 ## Vigencia de los datos configurados
 

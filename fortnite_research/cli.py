@@ -11,7 +11,7 @@ from .banner_delivery import prepare_wolverine_banners, send_banner_documents
 from .config import Settings
 from .deep_stw import build_deep_stw_report, save_deep_stw_report
 from .deep_icon_cup_research import build_deep_icon_cup_research_package
-from .evidence import sum_bytes
+from .evidence import probe_status_kind, sum_bytes
 from .icon_cup_research import build_icon_cup_research_package
 from .penny_bot import run_penny_bot
 from .video_brief import build_video_brief
@@ -53,6 +53,15 @@ def _client(settings: Settings) -> FortniteAPIClient:
         settings.api_timeout,
         trusted_api_hosts=settings.api_trusted_hosts,
     )
+
+
+def _max_bytes_from_mb(value: float | None) -> int | None:
+    """Convierte ``--max-mb`` en bytes, rechazando valores no positivos."""
+    if value is None:
+        return None
+    if value <= 0:
+        raise ValueError("--max-mb debe ser mayor que cero")
+    return int(value * 1_000_000)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,12 +111,31 @@ def build_parser() -> argparse.ArgumentParser:
     cosmetic.add_argument("--match-method", choices=["full", "contains", "starts", "ends"], default="contains")
     cosmetic.add_argument("--language", default="en")
     cosmetic.add_argument("--first-only", action="store_true")
+    cosmetic.add_argument(
+        "--max-mb",
+        type=float,
+        default=None,
+        help="Tamaño máximo de la respuesta en MB",
+    )
     cosmetic.add_argument("--send", action="store_true")
 
     generic = sub.add_parser("get", help="Consulta una ruta documentada directamente")
     generic.add_argument("path", help="Ejemplo: /v1/playlists")
     generic.add_argument("--param", action="append", default=[], help="Parámetro clave=valor; puede repetirse")
+    generic.add_argument(
+        "--max-mb",
+        type=float,
+        default=None,
+        help="Tamaño máximo de la respuesta en MB (por defecto 32; el catálogo BR completo lo necesita)",
+    )
     generic.add_argument("--send", action="store_true")
+
+    aes = sub.add_parser(
+        "aes",
+        help="Claves AES del build actual (/v2/aes; /v1/aes quedó retirada)",
+    )
+    aes.add_argument("--key-format", choices=["hex", "base64"], default="hex")
+    aes.add_argument("--send", action="store_true")
 
     servers = sub.add_parser("servers", help="Busca rutas de servidores/regiones y mide endpoints oficiales")
     servers.add_argument("--send", action="store_true", help="Envía el JSON como documento por Telegram")
@@ -191,7 +219,13 @@ def main(argv: list[str] | None = None) -> int:
                     response = client.get(path)
                     api_checks[path] = {"httpStatus": response.status_code, "available": True, "responseKeys": list(response.payload) if isinstance(response.payload, dict) else []}
                 except FortniteAPIError as exc:
-                    api_checks[path] = {"httpStatus": exc.status_code, "available": False, "errorType": "api_error"}
+                    api_checks[path] = {
+                        "httpStatus": exc.status_code,
+                        "available": False,
+                        "errorType": "api_error",
+                        "kind": probe_status_kind(exc.status_code),
+                        "detail": str(exc)[:160],
+                    }
             document = build_region_report(api_checks)
             output_path = save_region_report(document, settings.output_dir)
             label = "servidores-fortnite-na"
@@ -423,10 +457,23 @@ def main(argv: list[str] | None = None) -> int:
             result = client.news(args.kind, args.language)
             label = f"noticias-{args.kind}-{args.language}"
         elif args.command == "cosmetic-search":
-            result = client.cosmetic_search(args.name, args.language, args.match_method, not args.first_only)
+            result = client.cosmetic_search(
+                args.name,
+                args.language,
+                args.match_method,
+                not args.first_only,
+                max_bytes=_max_bytes_from_mb(args.max_mb),
+            )
             label = f"cosmeticos-{args.name}"
+        elif args.command == "aes":
+            result = client.aes(args.key_format)
+            label = f"claves-aes-{args.key_format}"
         else:
-            result = client.get(args.path, _params(args.param))
+            result = client.get(
+                args.path,
+                _params(args.param),
+                max_bytes=_max_bytes_from_mb(args.max_mb),
+            )
             label = args.path.strip("/").replace("/", "-")
         output_path = save_result(result, settings.output_dir, label)
         should_send = args.send or settings.auto_send_telegram

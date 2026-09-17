@@ -73,9 +73,18 @@ class ProbeDiagnosisTests(unittest.TestCase):
 
         self.assertIn("Sin respuesta", text)
 
+    def test_retired_route_is_not_reported_as_missing(self):
+        text = probe_interpretation(
+            {"httpStatus": 410, "available": False},
+            not_found="NO PUBLICADA",
+        )
+
+        self.assertIn("retirada", text.lower())
+        self.assertNotIn("NO PUBLICADA", text)
+
     def test_status_kinds(self):
         self.assertEqual(probe_status_kind(404), "not_found")
-        self.assertEqual(probe_status_kind(410), "not_found")
+        self.assertEqual(probe_status_kind(410), "retired")
         self.assertEqual(probe_status_kind(429), "rate_limited")
         self.assertEqual(probe_status_kind(200), "ok")
         self.assertEqual(probe_status_kind("n/d"), "no_response")

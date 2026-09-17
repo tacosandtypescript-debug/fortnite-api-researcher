@@ -2,8 +2,9 @@ import json
 import unittest
 from unittest.mock import patch
 
-from fortnite_research.client import FortniteAPIClient
+from fortnite_research.client import DEFAULT_MAX_BYTES, FortniteAPIClient
 from fortnite_research.telegram import TelegramDocumentSender, _multipart
+from fortnite_research.transport import HTTPResponse
 
 
 class FakeResponse:
@@ -21,6 +22,65 @@ class FakeResponse:
 
     def read(self, size=-1):
         return self.payload if size < 0 else self.payload[:size]
+
+
+class ResponseLimitTests(unittest.TestCase):
+    def _patch_fetch(self):
+        return patch(
+            "fortnite_research.client.fetch",
+            return_value=HTTPResponse(
+                status_code=200,
+                headers={},
+                body=json.dumps({"status": 200, "data": {}}).encode(),
+            ),
+        )
+
+    def test_default_limit_allows_the_full_catalog(self):
+        self.assertGreaterEqual(FortniteAPIClient().max_bytes, 32_000_000)
+
+    def test_per_request_limit_overrides_the_default(self):
+        client = FortniteAPIClient()
+        with self._patch_fetch() as mocked:
+            client.get("/v2/cosmetics/br", {"language": "es"}, max_bytes=64_000_000)
+
+        self.assertEqual(mocked.call_args.kwargs["max_bytes"], 64_000_000)
+
+    def test_default_limit_is_used_when_not_overridden(self):
+        client = FortniteAPIClient()
+        with self._patch_fetch() as mocked:
+            client.get("/v2/shop")
+
+        self.assertEqual(mocked.call_args.kwargs["max_bytes"], DEFAULT_MAX_BYTES)
+
+    def test_rejects_non_positive_limits(self):
+        with self.assertRaises(ValueError):
+            FortniteAPIClient(max_bytes=0)
+
+        client = FortniteAPIClient()
+        with self.assertRaises(ValueError):
+            client.get("/v2/shop", max_bytes=-1)
+
+    def test_aes_helper_uses_the_current_route(self):
+        client = FortniteAPIClient()
+        with self._patch_fetch() as mocked:
+            result = client.aes("base64")
+
+        url = mocked.call_args.args[0]
+        self.assertIn("/v2/aes", url)
+        self.assertIn("keyFormat=base64", url)
+        self.assertEqual(result.path, "/v2/aes")
+
+    def test_aes_rejects_unknown_format(self):
+        with self.assertRaises(ValueError):
+            FortniteAPIClient().aes("binario")
+
+    def test_full_catalog_helper_hits_v2_cosmetics_br(self):
+        client = FortniteAPIClient()
+        with self._patch_fetch() as mocked:
+            result = client.cosmetics_br("es")
+
+        self.assertIn("/v2/cosmetics/br", mocked.call_args.args[0])
+        self.assertEqual(result.status_code, 200)
 
 
 class ClientTests(unittest.TestCase):
