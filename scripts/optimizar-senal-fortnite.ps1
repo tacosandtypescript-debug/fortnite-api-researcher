@@ -1,6 +1,6 @@
 param(
     [switch]$Apply,
-    [switch]$NoSend,
+    [switch]$Send,
     [ValidateRange(4, 50)]
     [int]$Count = 20
 )
@@ -14,6 +14,30 @@ function Get-FirstMatchValue {
     )
     $match = [regex]::Match($Text, $Pattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor [System.Text.RegularExpressions.RegexOptions]::Multiline)
     if ($match.Success) { return $match.Groups[1].Value.Trim() }
+    return $null
+}
+
+function Test-IsElevated {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Resolve-PythonCommand {
+    # El alias de la Microsoft Store existe pero no ejecuta nada: se comprueba
+    # que el interprete responde antes de darlo por bueno.
+    foreach ($candidate in @(@{ Name = 'python'; Args = @() }, @{ Name = 'py'; Args = @('-3') })) {
+        $command = Get-Command $candidate.Name -ErrorAction SilentlyContinue
+        if (-not $command) { continue }
+        try {
+            & $command.Source @($candidate.Args + '--version') 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                return [ordered]@{ Source = $command.Source; Args = @($candidate.Args) }
+            }
+        } catch {
+            continue
+        }
+    }
     return $null
 }
 
@@ -35,7 +59,9 @@ function Get-WlanSnapshot {
     }
     $lines = @(netsh wlan show interfaces 2>$null)
     $text = $lines -join "`n"
-    if ($text -match '(?i)(no wireless interface|no hay ninguna interfaz inalambrica|no se encontr)' ) {
+    # Las salidas localizadas llevan tildes: se tolera cualquier vocal acentuada
+    # con '.' en lugar de exigir el texto sin acento (que nunca coincide).
+    if ($text -match '(?i)(no wireless interface|no hay ninguna interfaz inal.mbrica|no se encontr)' ) {
         return [ordered]@{
             available = $false
             serviceStatus = if ($service) { [string]$service.Status } else { $null }
@@ -49,12 +75,12 @@ function Get-WlanSnapshot {
             transmitRateMbps = $null
         }
     }
-    $signal = Get-FirstMatchValue $text '^(?:\s*Signal|\s*Senal)\s*:\s*(\d+)%'
+    $signal = Get-FirstMatchValue $text '^(?:\s*Signal|\s*Se.al)\s*:\s*(\d+)%'
     $channel = Get-FirstMatchValue $text '^(?:\s*Channel|\s*Canal)\s*:\s*(\d+)'
     $ssid = Get-FirstMatchValue $text '^\s*SSID\s*:\s*(.+)$'
     $radio = Get-FirstMatchValue $text '^(?:\s*Radio type|\s*Tipo de radio)\s*:\s*(.+)$'
-    $receive = Get-FirstMatchValue $text '^(?:\s*Receive rate \(Mbps\)|\s*Tasa de recepcion \(Mbps\))\s*:\s*(.+)$'
-    $transmit = Get-FirstMatchValue $text '^(?:\s*Transmit rate \(Mbps\)|\s*Tasa de transmision \(Mbps\))\s*:\s*(.+)$'
+    $receive = Get-FirstMatchValue $text '^(?:\s*Receive rate \(Mbps\)|\s*Tasa de recepci.n \(Mbps\))\s*:\s*(.+)$'
+    $transmit = Get-FirstMatchValue $text '^(?:\s*Transmit rate \(Mbps\)|\s*Tasa de transmisi.n \(Mbps\))\s*:\s*(.+)$'
     $state = Get-FirstMatchValue $text '^(?:\s*State|\s*Estado)\s*:\s*(.+)$'
     return [ordered]@{
         available = [bool]$signal
@@ -119,6 +145,17 @@ function Invoke-SafeOptimization {
         succeeded = ($LASTEXITCODE -eq 0)
         note = 'Limpia la cache DNS local; no cambia el proveedor DNS.'
     }
+    if (-not (Test-IsElevated)) {
+        # netsh necesita consola elevada. Antes el fallo se registraba como
+        # "succeeded = false" sin explicar por que y parecia un exito parcial.
+        $actions += [ordered]@{
+            action = 'netsh int tcp set global autotuninglevel=normal'
+            succeeded = $false
+            skipped = $true
+            note = 'Omitido: requiere consola elevada. Repite con PowerShell como administrador.'
+        }
+        return $actions
+    }
     $tcpOutput = @(netsh.exe int tcp set global autotuninglevel=normal 2>&1)
     $actions += [ordered]@{
         action = 'netsh int tcp set global autotuninglevel=normal'
@@ -140,6 +177,7 @@ $probes = @(
 )
 $optimization = [ordered]@{
     applied = [bool]$Apply
+    elevated = (Test-IsElevated)
     actions = @()
     note = if ($Apply) { 'Se solicitaron los ajustes conservadores.' } else { 'Modo auditoria: no se aplicaron cambios.' }
 }
@@ -160,6 +198,10 @@ $report = [ordered]@{
     networkAdapters = Get-NetworkAdapterSnapshot
     probes = $probes
     optimization = $optimization
+    privacy = [ordered]@{
+        containsPersonalData = @('investigation.computer', 'wifi.ssid', 'networkAdapters')
+        note = 'El informe incluye el nombre del equipo, el SSID de la Wi-Fi y los adaptadores. Se guarda en salidas/ y solo se envia por Telegram si se ejecuta con -Send.'
+    }
     safety = [ordered]@{
         changesNotMade = @('MTU', 'registro', 'servidores DNS', 'controladores', 'firewall', 'potencia del adaptador')
         limitation = 'El script mide la ruta y aplica ajustes conservadores; no puede aumentar fisicamente la senal de la antena ni garantizar un ping menor.'
@@ -170,23 +212,21 @@ $fileName = "{0}-diagnostico-senal-fortnite.json" -f (Get-Date).ToUniversalTime(
 $outputPath = Join-Path $outputDirectory $fileName
 $report | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $outputPath -Encoding UTF8
 
-if (-not $NoSend) {
+if ($Send) {
+    # Enviar es opt-in: el informe contiene datos del equipo y del SSID.
     Push-Location $projectRoot
     try {
-        $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
-        $pythonArguments = @()
-        if (-not $pythonCommand) {
-            $pythonCommand = Get-Command py -ErrorAction SilentlyContinue
-            $pythonArguments = @('-3')
+        $python = Resolve-PythonCommand
+        if (-not $python) {
+            throw 'No se encontro un Python funcional. Activa el entorno virtual o instala Python 3.10+.'
         }
-        if (-not $pythonCommand) {
-            throw 'No se encontró Python. Activa el entorno virtual o instala Python 3.10+.'
-        }
-        & $pythonCommand.Source @pythonArguments -m fortnite_research.cli send-file $outputPath --caption 'Diagnostico de senal Fortnite en Windows'
+        & $python.Source @($python.Args + @('-m', 'fortnite_research.cli', 'send-file', $outputPath, '--caption', 'Diagnostico de senal Fortnite en Windows'))
         if ($LASTEXITCODE -ne 0) { throw 'El envio por Telegram no fue confirmado' }
     } finally {
         Pop-Location
     }
+} else {
+    Write-Output "Envio omitido: el informe contiene nombre de equipo y SSID. Usa -Send para enviarlo por Telegram."
 }
 
 Write-Output "REPORTE: $outputPath"

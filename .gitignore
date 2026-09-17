@@ -1,6 +1,13 @@
 .env
 .env.*
 !.env.example
+# Credenciales que nunca deben entrar al repositorio
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets.*
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -21,6 +28,17 @@ build/
 .DS_Store
 Thumbs.db
 salidas/
+reports/
+
+# Documentos de trabajo y storyboards: son binarios de decenas de MB. Se
+# guardan fuera del repositorio (release o almacenamiento externo) para no
+# engordar cada clon.
+*.docx
+*.pptx
+*.doc
+*.ppt
+documentos/
+presentaciones/
 
 # Artefactos temporales de construcción y validación del storyboard
 .codex-finalizer-*/

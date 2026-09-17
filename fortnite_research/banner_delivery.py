@@ -7,9 +7,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .client import FortniteAPIClient, FortniteAPIError
+from .client import FortniteAPIClient
+from .evidence import sum_bytes
 from .schedule_assets import _data, _download_image, _slug
-from .telegram import TelegramDocumentSender, TelegramError
+from .telegram import TelegramDocumentSender
 
 
 WOLVERINE_BANNER_IDS: tuple[str, ...] = (
@@ -26,6 +27,7 @@ class BannerDelivery:
     files: tuple[Path, ...]
     ids: tuple[str, ...]
     bytes_total: int
+    missing: tuple[str, ...] = ()
 
 
 def _banner_index(value: Any) -> dict[str, dict[str, Any]]:
@@ -44,37 +46,57 @@ def prepare_wolverine_banners(
     language: str = "en",
     timeout: float = 30,
 ) -> BannerDelivery:
-    try:
-        response = client.get("/v1/banners", {"language": language})
-    except FortniteAPIError:
-        raise
+    """Descarga los banners disponibles y tolera que alguno falte.
+
+    Epic retira identificadores de banners con el tiempo. Antes, un solo id
+    ausente abortaba la entrega completa; ahora se informa de los que faltan y
+    solo se falla si no se pudo obtener ninguno. Los errores de datos se lanzan
+    como ``ValueError`` (no como error de Telegram, que aún no ha intervenido).
+    """
+    response = client.get("/v1/banners", {"language": language})
     banners = _banner_index(_data(response.payload))
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_dir.mkdir(parents=True, exist_ok=True)
     files: list[Path] = []
-    total_bytes = 0
+    download_entries: list[dict[str, Any]] = []
+    missing: list[str] = []
     for banner_id in WOLVERINE_BANNER_IDS:
         banner = banners.get(banner_id)
         if not banner:
-            raise TelegramError(f"No apareció el banner solicitado en Fortnite-API: {banner_id}")
+            missing.append(banner_id)
+            continue
         images = banner.get("images") or {}
         icon_url = images.get("icon") if isinstance(images, dict) else None
         if not icon_url:
-            raise TelegramError(f"El banner no tiene icono CDN: {banner_id}")
+            missing.append(banner_id)
+            continue
         destination = output_dir / f"{timestamp}-banner-{_slug(banner_id)}.png"
         result = _download_image(str(icon_url), destination, timeout)
         if not result.get("downloaded"):
-            raise TelegramError(f"No se pudo validar el PNG del banner: {banner_id}")
+            missing.append(banner_id)
+            continue
         files.append(destination)
-        total_bytes += int(result.get("bytes", 0))
-    return BannerDelivery(tuple(files), WOLVERINE_BANNER_IDS, total_bytes)
+        download_entries.append(result)
+    if not files:
+        raise ValueError(
+            "No se pudo descargar ningún banner de la lista configurada; "
+            "Epic pudo retirar estos identificadores de la API"
+        )
+    return BannerDelivery(
+        tuple(files),
+        WOLVERINE_BANNER_IDS,
+        sum_bytes(download_entries),
+        tuple(missing),
+    )
 
 
 def send_banner_documents(
     delivery: BannerDelivery,
     sender: TelegramDocumentSender,
 ) -> None:
-    for path, banner_id in zip(delivery.files, delivery.ids):
+    # ``strict=True``: si las dos listas se desalinearan, el envío debe fallar en
+    # vez de emparejar un archivo con el pie de otro banner.
+    for path, banner_id in zip(delivery.files, delivery.ids, strict=True):
         sender.send_document(
             path,
             caption=f"Banner Fortnite Marvel/Wolverine: {banner_id}",

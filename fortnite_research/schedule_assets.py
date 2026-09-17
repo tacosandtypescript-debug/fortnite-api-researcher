@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-import mimetypes
 import re
+import shutil
 import tempfile
 import unicodedata
 import urllib.parse
@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .client import FortniteAPIClient, FortniteAPIError
+from .evidence import staleness_notice, sum_bytes
 from .transport import (
     HTTPFetchError,
     ResponseTooLargeError,
@@ -28,6 +29,30 @@ from .transport import (
     write_bytes_atomic,
     write_text_atomic,
 )
+
+# Extensiones asociadas al formato real detectado por firma. La extensión de la
+# URL no es fiable: el CDN sirve WEBP con nombre .png y AVIF con Accept binario.
+_FORMAT_EXTENSIONS = {
+    "PNG": ".png",
+    "JPEG": ".jpg",
+    "GIF": ".gif",
+    "WEBP": ".webp",
+    "AVIF": ".avif",
+}
+
+# Fecha del último contraste a mano de las fechas y veredictos de TARGETS.
+TARGETS_VERIFIED_AT = "2026-09-15"
+TARGETS_MAX_AGE_DAYS = 10
+
+
+def _is_download(entry: dict[str, Any]) -> bool:
+    """Entrada que representa un archivo real descargado."""
+    return bool(entry.get("downloaded")) and not entry.get("deduplicated")
+
+
+def _is_failure(entry: dict[str, Any]) -> bool:
+    """Entrada descargada que falló (los duplicados no son fallos)."""
+    return not entry.get("downloaded") and not entry.get("deduplicated")
 
 
 @dataclass(frozen=True)
@@ -233,6 +258,7 @@ class ScheduleArtifacts:
     asset_count: int
     asset_bytes: int
     target_counts: dict[str, int]
+    deduplicated_count: int = 0
 
 
 def _data(payload: Any) -> Any:
@@ -413,6 +439,14 @@ def _public_status(url: str, timeout: float) -> dict[str, Any]:
             "available": 200 <= response.status_code < 300,
         }
     except HTTPFetchError as exc:
+        if isinstance(exc, ResponseTooLargeError):
+            return {
+                "url": url,
+                "httpStatus": exc.status_code,
+                "available": False,
+                "errorType": "size_exceeded",
+                "detail": "El histórico supera el límite de lectura; no significa que no exista",
+            }
         if exc.status_code is not None:
             return {"url": url, "httpStatus": exc.status_code, "available": False}
         return {
@@ -444,7 +478,22 @@ def _image_info(content: bytes, content_type: str | None) -> dict[str, Any]:
         return {"valid": True, "format": "GIF", "width": int.from_bytes(content[6:8], "little"), "height": int.from_bytes(content[8:10], "little")}
     if content.startswith(b"RIFF") and content[8:12] == b"WEBP":
         return {"valid": True, "format": "WEBP", "width": None, "height": None}
+    # AVIF/HEIF: caja ISO-BMFF con marca de compatibilidad. Se pedía en el
+    # Accept pero no se reconocía, así que una respuesta AVIF se descartaba.
+    if len(content) >= 12 and content[4:8] == b"ftyp" and content[8:12] in {b"avif", b"avis", b"mif1", b"heic"}:
+        return {"valid": True, "format": "AVIF", "width": None, "height": None}
     return {"valid": False, "format": kind or "unknown", "width": None, "height": None}
+
+
+def _destination_for_format(destination: Path, detected_format: Any) -> Path:
+    """Ajusta la extensión del archivo al formato realmente detectado."""
+    extension = _FORMAT_EXTENSIONS.get(str(detected_format).upper())
+    if not extension:
+        return destination
+    current = destination.suffix.lower()
+    if current == extension or (extension == ".jpg" and current == ".jpeg"):
+        return destination
+    return destination.with_suffix(extension)
 
 
 def _download_image(url: str, destination: Path, timeout: float) -> dict[str, Any]:
@@ -491,6 +540,7 @@ def _download_image(url: str, destination: Path, timeout: float) -> dict[str, An
     info = _image_info(content, content_type)
     if not info["valid"]:
         return {"url": url, "downloaded": False, "httpStatus": status, "errorType": "not_an_image"}
+    destination = _destination_for_format(destination, info["format"])
     write_bytes_atomic(destination, content)
     return {
         "url": url,
@@ -503,7 +553,25 @@ def _download_image(url: str, destination: Path, timeout: float) -> dict[str, An
         "width": info["width"],
         "height": info["height"],
         "path": destination.as_posix(),
+        "extension": destination.suffix.lower(),
     }
+
+
+def _validate_reference_image(source: Path) -> bytes:
+    """Valida una imagen aportada por el usuario **antes** de gastar red y disco.
+
+    Devuelve su contenido para no leerla dos veces. Antes el fallo aparecía al
+    copiarla, con las consultas y las descargas ya hechas.
+    """
+    if not source.is_file():
+        raise ValueError(f"La imagen de referencia no existe: {source}")
+    content = source.read_bytes()
+    if not _image_info(content, None).get("valid"):
+        raise ValueError(
+            "La imagen de referencia no tiene un formato válido "
+            f"(PNG, JPEG, GIF, WEBP o AVIF): {source}"
+        )
+    return content
 
 
 def _md_link(label: str, url: str) -> str:
@@ -526,8 +594,38 @@ def _build_report(
     shop_date: str | None,
 ) -> str:
     total_records = sum(len(item["records"]) for item in target_results)
-    total_assets = sum(1 for item in asset_entries if item.get("downloaded"))
-    total_bytes = sum(int(item.get("bytes", 0)) for item in asset_entries if item.get("downloaded"))
+    downloaded_assets = [item for item in asset_entries if _is_download(item)]
+    total_assets = len(downloaded_assets)
+    total_bytes = sum_bytes(downloaded_assets)
+    deduplicated = [item for item in asset_entries if item.get("deduplicated")]
+    banners_probe = next(
+        (probe for probe in api_probes if probe.get("name") == "banners"),
+        None,
+    ) or next(
+        (
+            probe
+            for probe in api_probes
+            if str(probe.get("path", "")).startswith("/v1/banners")
+        ),
+        None,
+    )
+    banners_ok = bool(banners_probe and banners_probe.get("available"))
+    banners_line = (
+        "- /v1/banners respondió correctamente, pero las coincidencias por estos nombres "
+        "fueron banners de perfil: no se encontró un banner promocional de tienda "
+        "asociado a la lista."
+        if banners_ok
+        else "- /v1/banners no respondió correctamente en esta ejecución: la ausencia de "
+        "banners promocionales no se puede concluir a partir de este informe."
+    )
+    today = datetime.now(timezone.utc)
+    targets_notice = staleness_notice(
+        "fechas y veredictos de colaboraciones",
+        TARGETS_VERIFIED_AT,
+        now=today,
+        max_age_days=TARGETS_MAX_AGE_DAYS,
+        sources="Tienda del juego y notas oficiales de Epic.",
+    )
     target_years = sorted(
         {
             str(item["target"].date)[:4]
@@ -550,14 +648,17 @@ def _build_report(
         "- Documentación de endpoints: https://dash.fortnite-api.com/endpoints/cosmetics.",
         "- Regla de evidencia: una coincidencia en la API confirma que el recurso existe en el catálogo; no confirma por sí sola una fecha futura de tienda.",
         "",
+        targets_notice,
+        "",
         "## Resultado ejecutivo",
         "",
         f"- Registros de cosméticos relacionados encontrados: **{total_records}**.",
         f"- Imágenes originales CDN descargadas y validadas: **{total_assets}**.",
         f"- Tamaño total de imágenes dentro del ZIP: **{total_bytes:,} bytes**.",
+        f"- Recursos repetidos entre objetivos (misma URL, no se descargan dos veces): **{len(deduplicated)}**.",
         f"- Fecha del feed de tienda consultado: {shop_date or 'no disponible'}.",
         f"- Registros cosméticos que expusieron un vídeo directo en su campo video: {video_record_count}.",
-        "- /v1/banners respondió correctamente, pero las coincidencias por estos nombres fueron banners de perfil: no se encontró un banner promocional de tienda asociado a la lista.",
+        banners_line,
         "",
         "## Resultado por fecha",
         "",
@@ -567,7 +668,7 @@ def _build_report(
         records: list[dict[str, Any]] = item["records"]
         relevant_assets = [
             asset for asset in asset_entries
-            if asset.get("target") == target.key and asset.get("downloaded")
+            if asset.get("target") == target.key and _is_download(asset)
         ]
         video_values = sorted(
             {
@@ -746,15 +847,19 @@ def build_schedule_package(
                 record_id = str(record.get("id") or record.get("name") or "sin-id")
                 for field, url in _record_image_urls(record):
                     if url in used_urls:
+                        # Un duplicado no es una descarga: antes se marcaba como
+                        # ``downloaded`` y sin bytes, así que inflaba el número
+                        # de archivos y dejaba corto el total en bytes.
                         asset_entries.append(
                             {
                                 "target": target.key,
                                 "recordId": record_id,
                                 "field": field,
                                 "url": url,
-                                "downloaded": True,
-                                "path": used_urls[url],
-                                "duplicateOfUrl": True,
+                                "downloaded": False,
+                                "deduplicated": True,
+                                "duplicateOf": used_urls[url],
+                                "bytes": 0,
                             }
                         )
                         continue
@@ -790,9 +895,10 @@ def build_schedule_package(
                                 "recordName": banner.get("name"),
                                 "field": f"banner.{field}",
                                 "url": url,
-                                "downloaded": True,
-                                "path": used_urls[url],
-                                "duplicateOfUrl": True,
+                                "downloaded": False,
+                                "deduplicated": True,
+                                "duplicateOf": used_urls[url],
+                                "bytes": 0,
                             }
                         )
                         continue
@@ -874,8 +980,11 @@ def build_schedule_package(
             "quality": "original CDN bytes; no photo conversion or resizing",
             "assets": asset_entries,
             "targets": target_counts,
+            "deduplicated": [
+                asset for asset in asset_entries if asset.get("deduplicated")
+            ],
             "failedDownloads": [
-                asset for asset in asset_entries if not asset.get("downloaded")
+                asset for asset in asset_entries if _is_failure(asset)
             ],
         }
         snapshot_path = staging_dir / "api_snapshot.json"
@@ -892,18 +1001,17 @@ def build_schedule_package(
             for file_path in staging_dir.rglob("*"):
                 if file_path.is_file() and file_path not in {manifest_path, snapshot_path}:
                     archive.write(file_path, arcname=file_path.relative_to(staging_dir).as_posix())
-        successful_assets = [asset for asset in asset_entries if asset.get("downloaded")]
+        successful_assets = [asset for asset in asset_entries if _is_download(asset)]
+        deduplicated_assets = [
+            asset for asset in asset_entries if asset.get("deduplicated")
+        ]
         return ScheduleArtifacts(
             report_path=report_path,
             archive_path=archive_path,
             asset_count=len(successful_assets),
-            asset_bytes=sum(int(asset.get("bytes", 0)) for asset in successful_assets),
+            asset_bytes=sum_bytes(successful_assets),
             target_counts=target_counts,
+            deduplicated_count=len(deduplicated_assets),
         )
     finally:
-        for file_path in sorted(staging_dir.rglob("*"), reverse=True):
-            if file_path.is_file() or file_path.is_symlink():
-                file_path.unlink(missing_ok=True)
-            elif file_path.is_dir():
-                file_path.rmdir()
-        staging_dir.rmdir()
+        shutil.rmtree(staging_dir, ignore_errors=True)

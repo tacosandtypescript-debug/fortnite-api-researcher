@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import time
 from collections import Counter
@@ -15,7 +16,14 @@ from typing import Any, Iterable
 from .client import FortniteAPIClient, FortniteAPIError
 from .config import Settings
 from .telegram import TelegramDocumentSender, TelegramError
-from .transport import HTTPFetchError, fetch, write_text_atomic
+from .transport import HTTPFetchError, fetch, redact_secrets, write_text_atomic
+
+# Límite de sendMessage de la Bot API. Los avisos largos se parten en varios
+# mensajes numerados en lugar de perderse.
+TELEGRAM_MESSAGE_LIMIT = 4096
+
+# Máximo de avisos ya reclamados que se reintentan en el ciclo siguiente.
+MAX_UNDELIVERED = 50
 
 
 class PennyAPIError(RuntimeError):
@@ -704,26 +712,32 @@ def _fresh_items(
     *,
     now: datetime,
     max_age_hours: float,
+    keep_undated: bool = False,
 ) -> tuple[NewContentItem | NewsItem, ...]:
     """Devuelve solo entradas fechadas dentro de la ventana notificable.
 
     No se considera válida una fecha que no se pueda interpretar. Una pequeña
     tolerancia futura absorbe diferencias de reloj entre el servidor y este
-    equipo sin permitir que el feed se adelante indefinidamente.
+    equipo sin permitir que el feed se adelante indefinidamente. Con
+    ``keep_undated`` las entradas sin fecha también pasan: los anuncios de
+    noticias no siempre traen ``added`` y descartarlos en silencio impedía
+    notificarlos nunca.
     """
     if max_age_hours <= 0:
         raise ValueError("max_age_hours debe ser mayor que cero")
     current = now.astimezone(timezone.utc)
     oldest = current - timedelta(hours=max_age_hours)
     newest = current + timedelta(minutes=5)
-    return tuple(
-        item
-        for item in items
-        if (
-            (added := _parse_utc_timestamp(item.added)) is not None
-            and oldest <= added <= newest
-        )
-    )
+    selected: list[NewContentItem | NewsItem] = []
+    for item in items:
+        added = _parse_utc_timestamp(item.added)
+        if added is None:
+            if keep_undated:
+                selected.append(item)
+            continue
+        if oldest <= added <= newest:
+            selected.append(item)
+    return tuple(selected)
 
 
 def _utc_label(value: datetime) -> str:
@@ -794,6 +808,7 @@ def _save_state(
     seen_new_content: Iterable[str] | None = None,
     news: NewsSnapshot | None = None,
     seen_news: Iterable[str] | None = None,
+    undelivered: Iterable[dict[str, str]] | None = None,
 ) -> None:
     payload = {
         "reset_date": snapshot.reset_date,
@@ -801,9 +816,11 @@ def _save_state(
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     if isinstance(previous_state, dict):
-        for state_key in ("new_content", "news"):
+        for state_key in ("new_content", "news", "undelivered"):
             existing_value = previous_state.get(state_key)
             if isinstance(existing_value, dict):
+                payload[state_key] = existing_value
+            elif isinstance(existing_value, list):
                 payload[state_key] = existing_value
     if new_content is not None and seen_new_content is not None:
         payload["new_content"] = {
@@ -816,7 +833,27 @@ def _save_state(
             "seen_keys": sorted(set(seen_news)),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+    if undelivered is not None:
+        payload["undelivered"] = [
+            {"caption": entry.get("caption", ""), "image_url": entry.get("image_url", "")}
+            for entry in list(undelivered)[:MAX_UNDELIVERED]
+        ]
     write_text_atomic(path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+
+
+def _undelivered_entries(state: dict[str, Any]) -> list[tuple[str, str]]:
+    """Recupera los avisos reclamados que no llegaron a entregarse."""
+    raw = state.get("undelivered")
+    if not isinstance(raw, list):
+        return []
+    entries: list[tuple[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        caption = _string(item.get("caption"))
+        if caption:
+            entries.append((caption, _string(item.get("image_url"))))
+    return entries
 
 
 def _new_content_state(state: dict[str, Any]) -> tuple[set[str], str, bool]:
@@ -854,13 +891,52 @@ def _sleep_interruptibly(seconds: float) -> None:
         time.sleep(min(60.0, remaining))
 
 
+def _split_message(text: str, *, limit: int = TELEGRAM_MESSAGE_LIMIT) -> list[str]:
+    """Parte un texto largo en mensajes que quepan en sendMessage.
+
+    Se corta por líneas para no romper una alerta por la mitad y se numera cada
+    parte para que el receptor sepa que el aviso continúa. Se reserva espacio
+    para el sufijo ``(n/total)`` de modo que ninguna parte supere ``limit``.
+    """
+    if len(text) <= limit:
+        return [text]
+    effective = max(limit - 24, 1)
+    chunks: list[str] = []
+    current: list[str] = []
+    current_length = 0
+    for line in text.splitlines(keepends=True):
+        while len(line) > effective:
+            # Una sola línea gigantesca: se corta en seco.
+            if current:
+                chunks.append("".join(current))
+                current, current_length = [], 0
+            chunks.append(line[:effective])
+            line = line[effective:]
+        if current_length + len(line) > effective:
+            chunks.append("".join(current))
+            current, current_length = [], 0
+        current.append(line)
+        current_length += len(line)
+    if current:
+        chunks.append("".join(current))
+    total = len(chunks)
+    parts = [
+        f"{chunk}\n\n({index}/{total})" if total > 1 else chunk
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    if any(len(part) > limit for part in parts):  # pragma: no cover - defensa
+        raise ValueError("La partición produjo una parte mayor que el límite")
+    return parts
+
+
 def _console_print(value: str) -> None:
     """Evita que una consola Windows con codificación antigua rompa el bot."""
+    text = redact_secrets(value)
     try:
-        print(value)
+        print(text)
     except UnicodeEncodeError:
         encoding = sys.stdout.encoding or "ascii"
-        print(value.encode(encoding, errors="replace").decode(encoding))
+        print(text.encode(encoding, errors="replace").decode(encoding))
 
 
 def _deliver_notification(
@@ -872,11 +948,13 @@ def _deliver_notification(
 ) -> None:
     """Envía una foto con pie o conserva un aviso de texto si no hay imagen."""
     if dry_run:
-        _console_print(caption)
+        for index, chunk in enumerate(_split_message(caption), start=1):
+            _console_print(f"[simulación {index}] {chunk}")
         if image_url:
             _console_print(f"Imagen: {image_url}")
         return
-    assert sender is not None
+    if sender is None:
+        raise TelegramError("No hay remitente de Telegram configurado")
     if image_url:
         try:
             sender.send_photo(image_url, caption)
@@ -884,7 +962,71 @@ def _deliver_notification(
         except TelegramError as exc:
             _console_print(f"AVISO: no se pudo enviar la imagen; se envía el texto ({exc})")
             caption = f"{caption}\n\n🖼️ Imagen no disponible en este momento."
-    sender.send_message(caption)
+    for chunk in _split_message(caption):
+        sender.send_message(chunk)
+
+
+class InstanceLockError(RuntimeError):
+    """Otra instancia del bot está usando el mismo archivo de estado."""
+
+
+class _InstanceLock:
+    """Bloqueo de instancia única apoyado en un archivo junto al estado.
+
+    Usa ``O_CREAT | O_EXCL``, que es atómico tanto en Windows como en POSIX. Un
+    bloqueo más antiguo que ``stale_after`` se considera abandonado (proceso
+    muerto sin limpiar) y se reaprovecha.
+    """
+
+    def __init__(self, state_path: Path, *, stale_after: float = 900.0):
+        self.state_path = Path(state_path)
+        self.lock_path = self.state_path.with_name(self.state_path.name + ".lock")
+        self.stale_after = stale_after
+        self._fd: int | None = None
+        self._owned = False
+
+    def acquire(self) -> bool:
+        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        for attempt in range(2):
+            try:
+                self._fd = os.open(self.lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if attempt == 1:
+                    return False
+                try:
+                    age = time.time() - self.lock_path.stat().st_mtime
+                except OSError:
+                    return False
+                if age < self.stale_after:
+                    return False
+                try:
+                    self.lock_path.unlink()
+                except OSError:
+                    return False
+                continue
+            except OSError:
+                return False
+            self._owned = True
+            try:
+                os.write(self._fd, f"{os.getpid()}\n".encode("ascii", "replace"))
+            except OSError:
+                pass
+            return True
+        return False
+
+    def release(self) -> None:
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        if self._owned:
+            try:
+                self.lock_path.unlink()
+            except OSError:
+                pass
+            self._owned = False
 
 
 def run_penny_bot(
@@ -927,6 +1069,13 @@ def run_penny_bot(
         f"/v2/news/br?language=es y /v2/news/stw?language=es; "
         f"ventana de novedades: {settings.new_content_max_age_hours:g}h"
     )
+    lock = _InstanceLock(state_path, stale_after=max(900.0, poll_interval * 3))
+    if not lock.acquire():
+        _console_print(
+            "ERROR DEL BOT: ya hay otra instancia en ejecución con el mismo estado "
+            f"({lock.lock_path}). Detén la anterior o elimina el bloqueo si es residual"
+        )
+        return 1
     try:
         while True:
             try:
@@ -1005,6 +1154,7 @@ def run_penny_bot(
                             news.items,
                             now=checked_at,
                             max_age_hours=settings.new_content_max_age_hours,
+                            keep_undated=True,
                         )
                         if isinstance(item, NewsItem)
                     )
@@ -1025,34 +1175,20 @@ def run_penny_bot(
                             )
                         )
 
-                if pending:
-                    for caption, image_url in pending:
-                        _deliver_notification(
-                            sender,
-                            caption=caption,
-                            image_url=image_url,
-                            dry_run=dry_run,
-                        )
-                    _console_print(
-                        "SIMULACIÓN: avisos preparados"
-                        if dry_run
-                        else f"AVISOS ENVIADOS POR TELEGRAM: {len(pending)}"
-                    )
-                elif not snapshot.has_alerts and not unseen_items and not unseen_news:
-                    _console_print(
-                        f"[{snapshot.reset_date}] Sin alertas de pavos ni llamas gratis; "
-                        "sin novedades recientes"
-                    )
-                else:
-                    _console_print(f"[{snapshot.reset_date}] Sin cambios")
+                carried = _undelivered_entries(state)
+                deliveries = [*carried, *pending]
+
+                next_seen = set(seen_keys)
+                if new_content is not None:
+                    next_seen.update(item.key for item in new_content.items)
+                next_seen_news = set(seen_news)
+                if news is not None:
+                    next_seen_news.update(item.key for item in news.items)
 
                 if not dry_run:
-                    next_seen = set(seen_keys)
-                    if new_content is not None:
-                        next_seen.update(item.key for item in new_content.items)
-                    next_seen_news = set(seen_news)
-                    if news is not None:
-                        next_seen_news.update(item.key for item in news.items)
+                    # Reclama antes de enviar: si el proceso muere entre el envío
+                    # y el guardado no se duplica el aviso, y lo que no llegue a
+                    # entregarse queda anotado para el ciclo siguiente.
                     _save_state(
                         state_path,
                         snapshot,
@@ -1062,6 +1198,49 @@ def run_penny_bot(
                         seen_new_content=next_seen if new_content is not None else None,
                         news=news,
                         seen_news=next_seen_news if news is not None else None,
+                    )
+
+                failed: list[dict[str, str]] = []
+                if deliveries:
+                    for caption, image_url in deliveries:
+                        try:
+                            _deliver_notification(
+                                sender,
+                                caption=caption,
+                                image_url=image_url,
+                                dry_run=dry_run,
+                            )
+                        except (TelegramError, OSError) as exc:
+                            failed.append({"caption": caption, "image_url": image_url})
+                            _console_print(
+                                f"AVISO NO ENTREGADO ({len(failed)}/{len(deliveries)}): {exc}"
+                            )
+                    _console_print(
+                        "SIMULACIÓN: avisos preparados"
+                        if dry_run
+                        else f"AVISOS ENVIADOS POR TELEGRAM: {len(deliveries) - len(failed)}"
+                    )
+                elif not snapshot.has_alerts and not unseen_items and not unseen_news:
+                    _console_print(
+                        f"[{snapshot.reset_date}] Sin alertas de pavos ni llamas gratis; "
+                        "sin novedades recientes"
+                    )
+                else:
+                    _console_print(f"[{snapshot.reset_date}] Sin cambios")
+
+                if not dry_run and failed != carried:
+                    # Solo se reescribe si cambió la lista de pendientes: los
+                    # fallos quedan registrados para reintentarlos una vez.
+                    _save_state(
+                        state_path,
+                        snapshot,
+                        fingerprint,
+                        previous_state=state,
+                        new_content=new_content,
+                        seen_new_content=next_seen if new_content is not None else None,
+                        news=news,
+                        seen_news=next_seen_news if news is not None else None,
+                        undelivered=failed,
                     )
             except (PennyAPIError, TelegramError, OSError) as exc:
                 _console_print(f"ERROR DEL BOT: {exc}")
@@ -1073,3 +1252,5 @@ def run_penny_bot(
     except KeyboardInterrupt:
         _console_print("Penny bot detenido")
         return 0
+    finally:
+        lock.release()

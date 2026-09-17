@@ -11,6 +11,7 @@ from .banner_delivery import prepare_wolverine_banners, send_banner_documents
 from .config import Settings
 from .deep_stw import build_deep_stw_report, save_deep_stw_report
 from .deep_icon_cup_research import build_deep_icon_cup_research_package
+from .evidence import sum_bytes
 from .icon_cup_research import build_icon_cup_research_package
 from .penny_bot import run_penny_bot
 from .video_brief import build_video_brief
@@ -20,6 +21,7 @@ from .schedule_assets import build_schedule_package
 from .sprite_research import build_sprite_research_package
 from .stw import build_stw_report, save_stw_report
 from .telegram import TelegramDocumentSender, TelegramError
+from .transport import redact_secrets
 
 
 def _params(values: list[str]) -> dict[str, str]:
@@ -254,6 +256,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"GUARDADO: {artifacts.report_path}")
                 print(f"GUARDADO: {artifacts.archive_path}")
             print(f"IMAGENES VALIDADAS: {artifacts.asset_count}; BYTES: {artifacts.asset_bytes}")
+            print(
+                f"RECURSOS REPETIDOS (misma URL, no reenviados): "
+                f"{artifacts.deduplicated_count}"
+            )
             print(f"REGISTROS POR OBJETIVO: {artifacts.target_counts}")
             return 0
         if args.command == "banners":
@@ -274,6 +280,11 @@ def main(argv: list[str] | None = None) -> int:
                 for path in delivery.files:
                     print(f"GUARDADO: {path}")
             print(f"BANNERS: {len(delivery.files)}; BYTES: {delivery.bytes_total}")
+            if delivery.missing:
+                print(
+                    "BANNERS NO DISPONIBLES EN LA API: "
+                    + ", ".join(delivery.missing)
+                )
             return 0
         if args.command == "sprites-research":
             client = _client(settings)
@@ -373,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
             selected = [item for item in artifacts.asset_entries if item.get("telegramDelivery") and item.get("downloaded")]
             successful = [item for item in artifacts.asset_entries if item.get("downloaded")]
             print(f"RECURSOS VALIDADOS: {len(successful)}; SELECCIONADOS PARA TELEGRAM: {len(selected)}")
-            print(f"BYTES ORIGINALES: {sum(int(item.get('bytes', 0)) for item in successful):,}")
+            print(f"BYTES ORIGINALES: {sum_bytes(successful):,}")
             for probe in artifacts.api_probes:
                 print(f"API {probe.get('name')}: HTTP {probe.get('httpStatus')}")
             return 0
@@ -427,7 +438,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"GUARDADO: {output_path}")
         return 0
     except (FortniteAPIError, TelegramError, ValueError, OSError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        # Redacción obligatoria: el token de Telegram viaja en el path de las
+        # URLs de la Bot API y un error de transporte puede citar la URL entera.
+        print(f"ERROR: {redact_secrets(exc)}", file=sys.stderr)
         return 1
 
 

@@ -4,10 +4,20 @@ on:
   push:
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   unittest:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     strategy:
+      # Un fallo en 3.10 no debe ocultar el resultado de 3.11-3.13.
+      fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     steps:
@@ -15,9 +25,75 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+          cache: pip
       - name: Install package
         run: python -m pip install -e .
       - name: Run unit tests
         run: python -m unittest discover -v
       - name: Compile sources
         run: python -m compileall -q fortnite_research tests
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install lint tooling
+        run: python -m pip install "ruff>=0.6"
+      - name: Ruff
+        run: ruff check .
+
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package with dev extras
+        run: python -m pip install -e ".[dev]"
+      - name: Measure coverage
+        # Se mide y se publica, pero todavía no hay umbral: la cobertura es baja
+        # (unos 25 casos) y un corte arbitrario bloquearía cualquier cambio.
+        run: |
+          coverage run -m unittest discover
+          coverage report -m
+          coverage xml
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+
+  windows:
+    # El proyecto está pensado para Windows (script de red, consola OEM) y hasta
+    # ahora solo se probaba en Linux.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install package
+        run: python -m pip install -e .
+      - name: Run unit tests
+        run: python -m unittest discover -v
+      - name: Check PowerShell syntax
+        shell: pwsh
+        run: |
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/scripts/optimizar-senal-fortnite.ps1", [ref]$null, [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error "L$($_.Extent.StartLineNumber): $($_.Message)" }
+            exit 1
+          }

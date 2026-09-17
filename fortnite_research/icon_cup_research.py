@@ -26,7 +26,14 @@ from pathlib import Path
 from typing import Any
 
 from .client import FortniteAPIClient, FortniteAPIError
-from .schedule_assets import _data, _download_image, _image_info, _slug
+from .evidence import describe_status, probe_interpretation, sum_bytes
+from .schedule_assets import (
+    _data,
+    _download_image,
+    _image_info,
+    _slug,
+    _validate_reference_image,
+)
 from .transport import (
     HTTPFetchError,
     ResponseTooLargeError,
@@ -292,7 +299,9 @@ def _image_urls_for_records(records: list[dict[str, Any]]) -> list[tuple[str, st
         record_id = str(record.get("id") or record.get("name") or "asset")
         images = record.get("images") if isinstance(record.get("images"), dict) else {}
 
-        def visit(node: Any, field: str) -> None:
+        def visit(node: Any, field: str, record_id: str = record_id) -> None:
+            # ``record_id`` se liga como argumento para que la closure no dependa
+            # de la variable del bucle.
             if isinstance(node, str) and node.startswith(("http://", "https://")):
                 if node not in seen:
                     seen.add(node)
@@ -422,10 +431,15 @@ def _download_binary(
     }
 
 
-def _copy_reference_image(source: Path, staging_dir: Path) -> dict[str, Any]:
-    if not source.is_file():
-        raise OSError(f"La imagen de referencia no existe: {source}")
-    content = source.read_bytes()
+def _copy_reference_image(
+    source: Path,
+    staging_dir: Path,
+    content: bytes | None = None,
+) -> dict[str, Any]:
+    if content is None:
+        if not source.is_file():
+            raise OSError(f"La imagen de referencia no existe: {source}")
+        content = source.read_bytes()
     content_type = mimetypes.guess_type(source.name)[0]
     info = _image_info(content, content_type)
     if not info.get("valid"):
@@ -453,8 +467,8 @@ def _copy_reference_image(source: Path, staging_dir: Path) -> dict[str, Any]:
 
 
 def _status(probe: dict[str, Any]) -> str:
-    value = probe.get("httpStatus")
-    return f"HTTP {value}" if value is not None else "sin respuesta"
+    text = describe_status(probe.get("httpStatus"))
+    return text if text == "sin respuesta" else f"HTTP {text}"
 
 
 def _md_link(label: str, url: str) -> str:
@@ -607,7 +621,13 @@ def _build_report(
     for query in queries:
         name = query.get("name")
         if name in {"eventsV1", "eventsV2", "tournamentsV1", "tournamentsV2"} and not query.get("available"):
-            interpretation = "Ruta de eventos/torneos no expuesta por Fortnite-API.com"
+            interpretation = probe_interpretation(
+                query,
+                not_found=(
+                    "Ruta de eventos/torneos no publicada por Fortnite-API.com (HTTP 404); "
+                    "no demuestra que el torneo no exista"
+                ),
+            )
         elif name == "setLilWayne":
             interpretation = "Catálogo exacto del set Lil Wayne"
         elif name == "newCosmetics":
@@ -625,11 +645,25 @@ def _build_report(
             "",
             "## Recursos entregados",
             "",
-            f"- Descargas válidas: **{len(successful_assets)}**; fallidas: **{len(failed_assets)}**; bytes originales: **{sum(int(item.get('bytes', 0)) for item in successful_assets):,}**.",
+            f"- Descargas válidas: **{len(successful_assets)}**; fallidas: **{len(failed_assets)}**; bytes originales: **{sum_bytes(successful_assets):,}**.",
             "- Se conserva la imagen adjunta del usuario sin recorte, conversión ni reescalado.",
             f"- Se incluyen la imagen original del post, el teaser oficial de Fortnite en MP4 si la descarga fue aceptada, su miniatura y las imágenes CDN que la API devolvió para los {len(set_records)} registros de Lil Wayne.",
             "- `api_snapshot.json` conserva las respuestas enfocadas y los resúmenes de estado sin API key, token de Telegram ni chat ID.",
             "- `manifest.json` contiene bytes, formato, dimensiones y SHA-256 para que puedas comprobar que Telegram recibió documentos originales.",
+            "",
+            "## Espejos públicos consultados",
+            "",
+            "| Consulta | Estado | Tipo |",
+            "|---|---:|---|",
+        ]
+    )
+    for check in public_checks:
+        detail = str(check.get("errorType") or check.get("dataType") or "ok")
+        lines.append(
+            f"| {check.get('name', 'consulta')} | {_status(check)} | {detail} |"
+        )
+    lines.extend(
+        [
             "",
             "## Fuentes",
             "",
@@ -652,11 +686,16 @@ def _build_report(
 def build_icon_cup_research_package(
     client: FortniteAPIClient,
     output_dir: Path,
-    reference_image: Path | None,
+    reference_image: Path | None = None,
     language: str = "en",
     timeout: float = 30,
 ) -> IconCupResearchArtifacts:
     """Consulta la API, conserva medios originales y genera informe + ZIP."""
+    reference_bytes = (
+        _validate_reference_image(reference_image)
+        if reference_image is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     retrieved_at = datetime.now(timezone.utc)
     retrieved_iso = retrieved_at.isoformat()
@@ -681,13 +720,9 @@ def build_icon_cup_research_package(
 
     set_records = _set_matches(values.get("setLilWayne"))
     new_value = values.get("newCosmetics")
-    new_records = [
-        _record_summary(record)
-        for record in _records(new_value)
-        if isinstance(record.get("set"), dict) and record["set"].get("value") == "Lil Wayne"
-    ]
-    # /v2/cosmetics/new is wrapped as {items: {br: [...]}}; _records can see
-    # the first useful list, but retain the exact Battle Royale count too.
+    # /v2/cosmetics/new llega envuelto como {items: {br: [...]}}; cuando esa
+    # forma no está, se recurre al primer listado útil del payload.
+    new_records: list[dict[str, Any]] = []
     new_br_count = None
     if isinstance(new_value, dict) and isinstance(new_value.get("items"), dict):
         br_items = new_value["items"].get("br")
@@ -700,6 +735,13 @@ def build_icon_cup_research_package(
                 and isinstance(record.get("set"), dict)
                 and record["set"].get("value") == "Lil Wayne"
             ]
+    if not new_records:
+        new_records = [
+            _record_summary(record)
+            for record in _records(new_value)
+            if isinstance(record.get("set"), dict)
+            and record["set"].get("value") == "Lil Wayne"
+        ]
 
     shop_value = values.get("shop")
     shop_matches = _text_matches(shop_value, ("lil wayne", "weezy", "young money"))
@@ -776,7 +818,11 @@ def build_icon_cup_research_package(
     try:
         reference_info: dict[str, Any] | None = None
         if reference_image is not None:
-            reference_info = _copy_reference_image(reference_image, staging_dir)
+            reference_info = _copy_reference_image(
+                reference_image,
+                staging_dir,
+                reference_bytes,
+            )
             asset_entries.append(reference_info)
 
         downloads: list[tuple[str, str, str, str]] = [
@@ -836,7 +882,7 @@ def build_icon_cup_research_package(
             report_path=report_path,
             archive_path=archive_path,
             asset_count=len(successful_assets),
-            asset_bytes=sum(int(item.get("bytes", 0)) for item in successful_assets),
+            asset_bytes=sum_bytes(successful_assets),
             api_probes=tuple(probes),
         )
     finally:

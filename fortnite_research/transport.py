@@ -13,6 +13,7 @@ reglas que deben ser iguales para la API, los CDN y las fuentes públicas:
 from __future__ import annotations
 
 import os
+import re
 import tempfile
 import time
 from contextlib import contextmanager
@@ -25,6 +26,46 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+# Cabeceras que nunca deben sobrevivir a una redirección a otro host.
+SENSITIVE_HEADERS = frozenset(
+    {"x-api-key", "authorization", "proxy-authorization", "cookie", "cookie2"}
+)
+
+REDACTED = "«oculto»"
+_SECRET_PATTERNS = (
+    # Token de la Bot API de Telegram: <bot_id>:<secreto>, con o sin el "bot"
+    # que precede al token en el path de las URLs de api.telegram.org.
+    re.compile(r"bot\d{5,}:[A-Za-z0-9_-]{20,}|\d{5,}:[A-Za-z0-9_-]{20,}"),
+    # Pares clave=valor o clave: valor habituales en cabeceras, URLs y cuerpos.
+    re.compile(
+        r"(?i)\b(x-api-key|api[_-]?key|apikey|authorization|bearer|bot[_-]?token"
+        r"|access[_-]?token|token|secret|password|passwd)\b(\s*[:=]\s*)([^\s&\"'|]+)"
+    ),
+    # Formatos de credencial de uso común, por si llegaran desde otro proyecto.
+    re.compile(r"\b(?:sk|ghp|gho|ghs|ghu|glpat|xox[baprs])[-_][A-Za-z0-9_-]{10,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+)
+
+
+def redact_secrets(value: object) -> str:
+    """Devuelve el texto con credenciales conocidas sustituidas.
+
+    Se aplica a cualquier mensaje que pueda acabar en consola, en un log o en
+    un informe: el token de Telegram viaja en el path de las URLs de la Bot API
+    y una URL se cuela con facilidad dentro de un error de transporte.
+    """
+    text = "" if value is None else str(value)
+    if not text:
+        return text
+    text = _SECRET_PATTERNS[0].sub(REDACTED, text)
+    text = _SECRET_PATTERNS[1].sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{REDACTED}",
+        text,
+    )
+    for pattern in _SECRET_PATTERNS[2:]:
+        text = pattern.sub(REDACTED, text)
+    return text
 
 
 class HTTPFetchError(RuntimeError):
@@ -122,7 +163,7 @@ class _SafeRedirectHandler(HTTPRedirectHandler):
                 getattr(redirected, "unredirected_hdrs", {}),
             ):
                 for key in list(mapping):
-                    if key.casefold() == "x-api-key":
+                    if key.casefold() in SENSITIVE_HEADERS:
                         del mapping[key]
         return redirected
 
@@ -137,7 +178,8 @@ def _open(
     return opener.open(request, timeout=timeout)
 
 
-def _retry_after(headers: Any) -> float | None:
+def retry_after_seconds(headers: Any, *, maximum: float = 8.0) -> float | None:
+    """Lee ``Retry-After`` en segundos y lo acota a un máximo prudente."""
     if headers is None:
         return None
     value = headers.get("Retry-After") if hasattr(headers, "get") else None
@@ -145,7 +187,7 @@ def _retry_after(headers: Any) -> float | None:
         seconds = float(value)
     except (TypeError, ValueError):
         return None
-    return min(max(seconds, 0.0), 8.0)
+    return min(max(seconds, 0.0), maximum)
 
 
 def _read_body(response: Any, max_bytes: int) -> bytes:
@@ -231,7 +273,9 @@ def fetch(
         except HTTPError as exc:
             body = _error_body(exc, min(max_bytes, 4096))
             error = HTTPFetchError(
-                f"HTTP {exc.code}: {body.decode('utf-8', errors='replace')[:1000]}",
+                redact_secrets(
+                    f"HTTP {exc.code}: {body.decode('utf-8', errors='replace')[:1000]}"
+                ),
                 status_code=int(exc.code),
                 body=body,
                 headers=exc.headers,
@@ -239,12 +283,14 @@ def fetch(
             retryable = exc.code in RETRYABLE_STATUS_CODES
         except (URLError, TimeoutError, OSError) as exc:
             error = HTTPFetchError(
-                f"Error de transporte: {str(getattr(exc, 'reason', exc))[:300]}"
+                redact_secrets(
+                    f"Error de transporte: {str(getattr(exc, 'reason', exc))[:300]}"
+                )
             )
             retryable = True
         if attempt >= retries or not retryable:
             raise error
-        delay = _retry_after(getattr(error, "headers", None))
+        delay = retry_after_seconds(getattr(error, "headers", None))
         if delay is None:
             delay = min(0.4 * (2**attempt), 4.0)
         time.sleep(delay)

@@ -19,6 +19,7 @@ from .deep_icon_cup_research import (
     _spanish_type,
     _type_value,
 )
+from .evidence import staleness, staleness_notice
 from .icon_cup_research import (
     BEEBOM_URL,
     EPIC_COMPETITIVE_URL,
@@ -105,6 +106,12 @@ WEEZY_EVENT_FACTS = {
     },
 }
 
+# Fecha en la que se contrastaron a mano los hechos competitivos de arriba.
+# El informe avisa cuando este snapshot envejece: unos premios o una hora
+# caducados locutados como confirmados son el error más caro del módulo.
+WEEZY_FACTS_VERIFIED_AT = "2026-09-15"
+WEEZY_FACTS_MAX_AGE_DAYS = 10
+
 
 @dataclass(frozen=True)
 class VideoBriefArtifacts:
@@ -116,12 +123,6 @@ class VideoBriefArtifacts:
 def _contains(value: Any, terms: tuple[str, ...]) -> bool:
     encoded = json.dumps(value, ensure_ascii=False).casefold()
     return any(term.casefold() in encoded for term in terms)
-
-
-def _duration_text(seconds: Any) -> str:
-    total = int(seconds or 0)
-    minutes, remaining = divmod(total, 60)
-    return f"{minutes}:{remaining:02d}"
 
 
 def build_video_brief(
@@ -237,9 +238,25 @@ def build_video_brief(
         "verification": {
             "mode": "configured_snapshot",
             "revalidatedInThisRun": False,
+            "verifiedAt": WEEZY_FACTS_VERIFIED_AT,
+            "maxAgeDays": WEEZY_FACTS_MAX_AGE_DAYS,
             "note": "Los datos competitivos están configurados en el repositorio y no se vuelven a consultar automáticamente.",
         },
     }
+    facts_age_days, facts_stale = staleness(
+        WEEZY_FACTS_VERIFIED_AT,
+        now=retrieved,
+        max_age_days=WEEZY_FACTS_MAX_AGE_DAYS,
+    )
+    snapshot_event_evidence["verification"]["ageDays"] = facts_age_days
+    snapshot_event_evidence["verification"]["stale"] = facts_stale
+    facts_notice = staleness_notice(
+        "datos competitivos del evento",
+        WEEZY_FACTS_VERIFIED_AT,
+        now=retrieved,
+        max_age_days=WEEZY_FACTS_MAX_AGE_DAYS,
+        sources="Pestaña Competir del juego y biblioteca de reglas de Epic.",
+    )
     public_checks, post = _read_public_post(timeout)
     post_text = str((post or {}).get("text") or "no disponible").replace("\n", " / ")
     post_date = str((post or {}).get("createdAt") or "no disponible")
@@ -281,6 +298,8 @@ def build_video_brief(
         f"**Investigación actualizada:** {retrieved_iso}",
         "**Objetivo:** video informativo de 60–90 segundos, sin presentar rumores como confirmaciones.",
         "",
+        facts_notice,
+        "",
         "## Veredicto para el video",
         "",
         f"La colaboración de Lil Wayne tiene {len(set_records)} registros BR en el snapshot ({catalog_summary}), {len(tracks)} canciones de Festival y {len(instruments)} instrumento(s) relacionado(s). Los atuendos encontrados son: {outfit_names}. La ficha competitiva configurada para esta investigación indica {official_event.get('region')} el {official_event.get('date')}, con {', '.join(official_event.get('modes', [])) or 'modo no indicado'}.",
@@ -295,8 +314,8 @@ def build_video_brief(
         f"| Fecha y hora | {official_event.get('date', 'no indicada')}, {official_event.get('displayedStart', 'n/d')}–{official_event.get('displayedEnd', 'n/d')} | Snapshot configurado |",
         f"| Modos | {', '.join(official_event.get('modes', [])) or 'no indicados'} | Snapshot configurado |",
         f"| Plataformas | {', '.join(official_event.get('platformsListed', [])) or 'no indicadas'} | Snapshot configurado |",
-        f"| Premio por colocación | {next((item.get('condition', 'n/d') + ': ' + ', '.join(item.get('items', [])) for item in public_event.get('prizes', []) if item.get('condition') == 'Top 700'), 'no configurado')} | Snapshot configurado |",
-        f"| Premio por puntos | {next((item.get('condition', 'n/d') + ': ' + ', '.join(item.get('items', [])) for item in public_event.get('prizes', []) if item.get('condition') != 'Top 700'), 'no configurado')} | Snapshot configurado |",
+        f"| Premio por colocación | Top 700: {placement_prize} | Snapshot configurado |",
+        f"| Premio por puntos | {points_prize} | Snapshot configurado |",
         f"| Partidas máximas | {public_event.get('matchCap', 'no indicado')} | Snapshot configurado |",
         f"| Requisitos explícitos | {official_event.get('minimumAge', 'n/d')} años; MFA: {'sí' if official_event.get('mfaRequired') else 'no indicada'} | Snapshot configurado |",
         "",
@@ -376,7 +395,7 @@ def build_video_brief(
         f"- [Horario oficial NAC de la Copa de ídolos de Weezy]({EPIC_WEEZY_SCHEDULE_URL}) — URL de referencia; el snapshot local indica {event_date}, {event_time}.",
         f"- [Ficha de Fortnite Tracker: Battle Royale]({TRACKER_WEEZY_BR_URL}) y [Zero Build]({TRACKER_WEEZY_ZB_URL}) — tabla pública de puntuación, límite de partidas y premios del feed del evento.",
         f"- [Set Lil Wayne en Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/br/search/all?set=Lil%20Wayne&matchMethod=full&language=en) — {len(set_records)} objetos BR en esta ejecución.",
-        f"- [Canciones de Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/tracks?language=en) — carátulas y metadatos de Festival.",
+        "- [Canciones de Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/tracks?language=en) — carátulas y metadatos de Festival.",
         f"- [Instrumentos de Fortnite-API.com](https://fortnite-api.com/v2/cosmetics/instruments?language=en) — {instrument_names}.",
         f"- [Item Shop Cups de Epic]({EPIC_ITEM_SHOP_CUPS_URL}) — marco general y reglas variables por copa.",
         f"- [Agenda competitiva oficial]({EPIC_COMPETITIVE_URL}) y [Rules Library]({EPIC_RULES_LIBRARY_URL}) — revisión de publicación y reglamento específico.",

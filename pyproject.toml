@@ -6,12 +6,56 @@ build-backend = "setuptools.build_meta"
 name = "fortnite-api-researcher"
 version = "0.1.0"
 description = "Consultas reproducibles a Fortnite-API.com con entrega opcional por Telegram"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "tacosandtypescript-debug" }]
+keywords = ["fortnite", "fortnite-api", "telegram", "research", "stw", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: WWW/HTTP",
+    "Topic :: Utilities",
+]
 dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "coverage>=7",
+    "ruff>=0.6",
+]
 
 [project.scripts]
 fortnite-research = "fortnite_research.cli:main"
 
+[project.urls]
+Repository = "https://github.com/tacosandtypescript-debug/fortnite-api-researcher"
+
 [tool.setuptools.packages.find]
 include = ["fortnite_research*"]
 
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Reglas que el proyecto cumple hoy y que el CI exige: errores reales (nombres
+# no definidos, imports sin usar, closures que capturan mal la variable de un
+# bucle) sin imponer un estilo que obligue a reescribir los informes.
+select = ["E4", "E7", "E9", "F", "B006", "B008", "B023"]
+
+[tool.coverage.run]
+source = ["fortnite_research"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

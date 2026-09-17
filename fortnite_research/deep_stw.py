@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from .client import FortniteAPIClient
-from .stw import build_stw_report
+from .stw import MISSION_ALERT_CANDIDATES, build_stw_report
 from .transport import HTTPFetchError, fetch, write_text_atomic
 
 
@@ -408,12 +408,7 @@ def build_deep_stw_report(
     def api_status(path: str) -> str:
         return _status_line(checks_by_path.get(path, {}))
 
-    candidate_paths = (
-        "/v2/missions",
-        "/v2/alerts",
-        "/v2/stw/missions",
-        "/v2/stw/alerts",
-    )
+    candidate_paths = MISSION_ALERT_CANDIDATES
     candidate_statuses = "; ".join(
         f"{path}: {api_status(path)}" for path in candidate_paths
     )
@@ -452,11 +447,13 @@ def build_deep_stw_report(
     full_stw_messages = compact_api["stwFeed"]["messages"]
     if full_stw_messages:
         first_message = full_stw_messages[0]
-        message_text = f"- **{first_message.get('title') or 'Sin título'}:** {first_message.get('body') or 'Sin cuerpo'}\\n"
+        # ``\n`` de verdad, no la secuencia escapada: antes se colaba un "\n"
+        # literal en el Markdown del informe.
+        message_text = f"- **{first_message.get('title') or 'Sin título'}:** {first_message.get('body') or 'Sin cuerpo'}\n"
         if first_message.get("image"):
-            message_text += f"- Imagen asociada: {first_message['image']}\\n"
+            message_text += f"- Imagen asociada: {first_message['image']}\n"
     else:
-        message_text = "- No llegó ningún mensaje en la respuesta STW.\\n"
+        message_text = "- No llegó ningún mensaje en la respuesta STW.\n"
     markdown = f"""# Investigación profunda: endpoints de Salvar el Mundo (STW)
 
 **Consulta:** {retrieved_at.isoformat()}  

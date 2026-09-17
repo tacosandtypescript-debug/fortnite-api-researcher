@@ -12,7 +12,6 @@ from fortnite_research.penny_bot import (
     NewContentClient,
     NewContentItem,
     NewContentSnapshot,
-    NewsItem,
     NewsSnapshot,
     PennySnapshot,
     VbucksAlert,

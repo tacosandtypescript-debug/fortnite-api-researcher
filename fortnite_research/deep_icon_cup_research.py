@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any
 
 from .client import FortniteAPIClient, FortniteAPIError
+from .evidence import int_or_zero, probe_interpretation, sum_bytes
 from .icon_cup_research import (
     BEEBOM_URL,
     EPIC_ITEM_SHOP_CUPS_URL,
@@ -42,6 +43,7 @@ from .icon_cup_research import (
     _read_public_post,
     _safe_public_json,
     _tweet_payload,
+    _validate_reference_image,
 )
 from .schedule_assets import _data, _download_image, _image_info, _slug
 from .transport import atomic_zipfile, write_bytes_atomic, write_text_atomic
@@ -369,7 +371,6 @@ def _build_report(
         "",
         "### Conteo actual de Battle Royale",
         "",
-        " | ".join([]) if False else "",
         "| Tipo | Cantidad |",
         "|---|---:|",
     ]
@@ -442,7 +443,9 @@ def _build_report(
         ]
     )
     for record in related_tracks:
-        duration = int(record.get("duration", 0) or 0)
+        # ``duration`` puede llegar como texto ("3:45"): un casteo directo
+        # abortaba el informe después de descargar todo el expediente.
+        duration = int_or_zero(record.get("duration"))
         minutes, seconds = divmod(duration, 60)
         lines.append(
             f"| **{record.get('title', 'sin título')}** | {record.get('artist', 'n/d')} | {record.get('releaseYear', 'n/d')} | {record.get('bpm', 'n/d')} | {minutes}:{seconds:02d} | `{record.get('id', 'n/d')}` |"
@@ -495,7 +498,13 @@ def _build_report(
         elif name in {"nameLilWayne", "nameWeezy", "nameYoungMoney", "nameThaGuitar", "nameYMburner"}:
             finding = "Búsqueda nominal de catálogo"
         elif name in {"eventsV1", "eventsV2", "tournamentsV1", "tournamentsV2"} and not probe.get("available"):
-            finding = "No expuesto por Fortnite-API.com; no equivale a inexistencia en Fortnite"
+            finding = probe_interpretation(
+                probe,
+                not_found=(
+                    "No publicado por Fortnite-API.com (HTTP 404); "
+                    "no equivale a inexistencia en Fortnite"
+                ),
+            )
         elif name == "shop":
             finding = "Feed actual; no es calendario futuro"
         elif name == "news":
@@ -508,7 +517,7 @@ def _build_report(
             "",
             "## Archivos originales preparados",
             "",
-            f"Se validaron **{len(successful)} archivos** ({sum(int(item.get('bytes', 0)) for item in successful):,} bytes). De ellos, **{len(delivery)}** son los archivos seleccionados para enviarse individualmente por Telegram; las imágenes secundarias no seleccionadas quedan dentro del expediente local para auditoría.",
+            f"Se validaron **{len(successful)} archivos** ({sum_bytes(successful):,} bytes). De ellos, **{len(delivery)}** son los archivos seleccionados para enviarse individualmente por Telegram; las imágenes secundarias no seleccionadas quedan dentro del expediente local para auditoría.",
             "",
             "- Las imágenes se descargaron desde las URLs devueltas por el catálogo y se conservaron sin recorte, conversión ni reescalado.",
             "- Las canciones se entregan como carátulas JPG del catálogo; no se descarga audio que la API no expone.",
@@ -525,7 +534,7 @@ def _build_report(
     for item in delivery:
         dimensions = f"{item.get('width', 'n/d')} × {item.get('height', 'n/d')}" if item.get("width") else "vídeo / n/d"
         lines.append(
-            f"| `{Path(str(item.get('path', ''))).name}` | {item.get('caption', 'Recurso Fortnite')} | {dimensions} | {int(item.get('bytes', 0)):,} |"
+            f"| `{Path(str(item.get('path', ''))).name}` | {item.get('caption', 'Recurso Fortnite')} | {dimensions} | {int_or_zero(item.get('bytes')):,} |"
         )
     if failed:
         lines.extend(["", "### Descargas fallidas", ""])
@@ -594,6 +603,13 @@ def build_deep_icon_cup_research_package(
     timeout: float = 30,
 ) -> DeepIconCupArtifacts:
     """Consulta el estado actual, descarga medios relacionados y genera expediente."""
+    # Se valida la imagen de referencia antes de gastar red y disco: antes el
+    # fallo llegaba al copiarla, con el expediente ya descargado entero.
+    reference_bytes = (
+        _validate_reference_image(reference_image)
+        if reference_image is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     retrieved = datetime.now(timezone.utc)
     retrieved_iso = retrieved.isoformat()
@@ -695,7 +711,11 @@ def build_deep_icon_cup_research_package(
     try:
         # Keep the user-provided reference in the local evidence package.
         if reference_image is not None:
-            reference_info = _copy_reference_image(reference_image, staging_dir)
+            reference_info = _copy_reference_image(
+                reference_image,
+                staging_dir,
+                reference_bytes,
+            )
             reference_info.update(
                 {
                     "label": "reference-post",
@@ -757,8 +777,11 @@ def build_deep_icon_cup_research_package(
                 items,
                 key=lambda item: (
                     _best_priority(str(item.get("field", ""))),
-                    -(int(item.get("width") or 0) * int(item.get("height") or 0)),
-                    -int(item.get("bytes") or 0),
+                    -(
+                        int_or_zero(item.get("width"))
+                        * int_or_zero(item.get("height"))
+                    ),
+                    -int_or_zero(item.get("bytes")),
                 ),
             )[0]
             best["telegramDelivery"] = True
@@ -774,13 +797,20 @@ def build_deep_icon_cup_research_package(
         # Also send distinct style renders for the outfits and the reactive
         # back bling. Do not send a second copy when an API variant URL returns
         # the same bytes as another option.
-        selected_hashes = {str(item.get("sha256")) for item in chosen_by_record.values()}
+        # Only los hashes presentes cuentan para deduplicar: un sha256 ausente
+        # convertía la comparación en "None == None" y colaba duplicados.
+        selected_hashes = {
+            str(item.get("sha256"))
+            for item in chosen_by_record.values()
+            if item.get("sha256")
+        }
         for item in asset_entries:
+            item_hash = str(item.get("sha256") or "")
             if (
                 item.get("kind") != "fortnite_api_related"
                 or not item.get("downloaded")
                 or not str(item.get("field", "")).startswith("variants")
-                or str(item.get("sha256")) in selected_hashes
+                or (item_hash and item_hash in selected_hashes)
             ):
                 continue
             item["telegramDelivery"] = True
@@ -788,16 +818,7 @@ def build_deep_icon_cup_research_package(
                 f"{item.get('recordName') or item.get('recordId') or 'Recurso Fortnite'} — "
                 f"variante de {_spanish_type(str(item.get('category') or ''), next((record for record in related.get(str(item.get('category') or ''), []) if str(record.get('id')) == str(item.get('recordId'))), {}))} — imagen original"
             )
-            selected_hashes.add(str(item.get("sha256")))
-
-        snapshot["selectedDelivery"] = [
-            {
-                key: value
-                for key, value in item.items()
-                if key not in {"url"} or value is not None
-            }
-            for item in chosen_by_record.values()
-        ]
+            selected_hashes.add(item_hash)
 
         timestamp_label = retrieved.strftime("%Y%m%dT%H%M%SZ")
         report = _build_report(retrieved_iso, snapshot, asset_entries)
@@ -805,49 +826,32 @@ def build_deep_icon_cup_research_package(
         snapshot_path = output_dir / f"{timestamp_label}-api-snapshot-deep-weezy.json"
         manifest_path = output_dir / f"{timestamp_label}-manifest-deep-weezy.json"
         archive_path = output_dir / f"{timestamp_label}-recursos-deep-weezy-icon-cup.zip"
-        write_text_atomic(report_path, report)
-        write_text_atomic(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
-        manifest = {
-            "generatedAt": retrieved_iso,
-            "source": "Fortnite-API.com + public X syndication + Epic public sources + attached reference image",
-            "quality": "original bytes; no conversion, crop or resizing",
-            "assets": asset_entries,
-            "selectedDelivery": list(chosen_by_record.values()),
-            "failedDownloads": [item for item in asset_entries if not item.get("downloaded")],
-        }
-        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
-
-        # Add report/snapshot/manifest and all binary files to a local backup.
-        with atomic_zipfile(archive_path, compresslevel=6) as archive:
-            archive.write(report_path, arcname="INFORME-profundo-weezy-icon-cup.md")
-            archive.write(snapshot_path, arcname="api-snapshot-deep-weezy.json")
-            archive.write(manifest_path, arcname="manifest-deep-weezy.json")
-            for file_path in staging_dir.rglob("*"):
-                if file_path.is_file():
-                    archive.write(file_path, arcname=file_path.relative_to(staging_dir).as_posix())
-
-        successful = [item for item in asset_entries if item.get("downloaded") and item.get("path")]
-        asset_paths = tuple(staging_dir / str(item["path"]) for item in successful)
-        # Copy files selected for Telegram into a stable output directory. The
-        # staging directory is removed in finally, so delivery must not point
-        # to temporary paths.
+        successful = [
+            item
+            for item in asset_entries
+            if item.get("downloaded") and item.get("path")
+        ]
+        # Copia estable para Telegram: el directorio de trabajo se borra en el
+        # ``finally``, así que la entrega no puede apuntar a rutas temporales.
+        # Se conserva la ruta relativa para que dos recursos con el mismo nombre
+        # de archivo no se pisen entre sí.
         stable_dir = output_dir / "Weezy Icon Cup - archivos profundos"
         stable_dir.mkdir(parents=True, exist_ok=True)
         stable_entries: list[dict[str, Any]] = []
         stable_paths: list[Path] = []
         for item in successful:
-            source = staging_dir / str(item["path"])
+            relative = Path(str(item["path"]))
+            source = staging_dir / relative
             if not source.is_file():
                 continue
-            destination = stable_dir / source.name
+            destination = stable_dir / relative
             write_bytes_atomic(destination, source.read_bytes())
             copied = dict(item)
             copied["path"] = destination.as_posix()
             stable_entries.append(copied)
             if copied.get("telegramDelivery"):
                 stable_paths.append(destination)
-        manifest["stableFiles"] = stable_entries
-        snapshot["selectedDelivery"] = [
+        selected_stable = [
             {
                 key: value
                 for key, value in item.items()
@@ -856,21 +860,49 @@ def build_deep_icon_cup_research_package(
             for item in stable_entries
             if item.get("telegramDelivery") and item.get("downloaded")
         ]
-        write_text_atomic(snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n")
-        write_text_atomic(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+        snapshot["selectedDelivery"] = selected_stable
+        manifest = {
+            "generatedAt": retrieved_iso,
+            "source": (
+                "Fortnite-API.com + public X syndication + Epic public sources + "
+                "attached reference image"
+            ),
+            "quality": "original bytes; no conversion, crop or resizing",
+            "assets": asset_entries,
+            "stableFiles": stable_entries,
+            "selectedDelivery": selected_stable,
+            "failedDownloads": [
+                item for item in asset_entries if not item.get("downloaded")
+            ],
+        }
+
+        # Una sola escritura de informe, snapshot, manifiesto y ZIP. Antes se
+        # escribían dos veces (y se re-zipeaba todo) sobre expedientes de cientos
+        # de megabytes.
+        write_text_atomic(report_path, report)
+        write_text_atomic(
+            snapshot_path, json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n"
+        )
+        write_text_atomic(
+            manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+        )
         with atomic_zipfile(archive_path, compresslevel=6) as archive:
             archive.write(report_path, arcname="INFORME-profundo-weezy-icon-cup.md")
             archive.write(snapshot_path, arcname="api-snapshot-deep-weezy.json")
             archive.write(manifest_path, arcname="manifest-deep-weezy.json")
             for file_path in staging_dir.rglob("*"):
                 if file_path.is_file():
-                    archive.write(file_path, arcname=file_path.relative_to(staging_dir).as_posix())
+                    archive.write(
+                        file_path,
+                        arcname=file_path.relative_to(staging_dir).as_posix(),
+                    )
             for file_path in stable_dir.rglob("*"):
                 if file_path.is_file():
-                    archive.write(file_path, arcname=Path("stable") / file_path.relative_to(stable_dir))
+                    archive.write(
+                        file_path,
+                        arcname=(Path("stable") / file_path.relative_to(stable_dir)).as_posix(),
+                    )
 
-        stable_successful = [item for item in stable_entries if item.get("downloaded")]
-        delivery_count = sum(1 for item in stable_successful if item.get("telegramDelivery"))
         return DeepIconCupArtifacts(
             report_path=report_path,
             snapshot_path=snapshot_path,

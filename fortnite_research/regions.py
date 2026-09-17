@@ -6,6 +6,7 @@ import json
 import re
 import socket
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,20 +27,40 @@ SOURCES = (
     "https://fortnite-api.com/",
 )
 
+# Etiquetas del resumen de ping. Se busca cada valor por su etiqueta (en inglés
+# y en español, con el punto comodín para las tildes) en vez de fiarse del orden:
+# asignar min/avg/max por posición etiquetaba mal las métricas en silencio.
+_LABEL_PATTERNS = {
+    "minMs": re.compile(r"(?:Minimum|M.nimo)\s*=\s*(\d+)\s*ms", re.IGNORECASE),
+    "maxMs": re.compile(r"(?:Maximum|M.ximo)\s*=\s*(\d+)\s*ms", re.IGNORECASE),
+    "avgMs": re.compile(
+        r"(?:Average|Media|Promedio)\s*=\s*(\d+)\s*ms",
+        re.IGNORECASE,
+    ),
+}
 
-def _resolve_ipv4(host: str) -> list[str]:
+
+def _resolve_ipv4(host: str) -> tuple[list[str], str | None]:
+    """Devuelve direcciones IPv4 y, por separado, el error de resolución."""
     try:
         addresses = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
     except OSError as exc:
-        return [f"resolution-error: {exc}"]
-    return sorted({item[4][0] for item in addresses})
+        return [], str(exc)
+    return sorted({item[4][0] for item in addresses}), None
 
 
-def _ping(host: str) -> dict[str, Any]:
-    """Hace cuatro pings sin shell y tolera la localización de Windows."""
+def _ping_command(host: str, count: int) -> list[str]:
+    """Comando de ping multiplataforma, siempre sin shell."""
+    if sys.platform.startswith("win"):
+        return ["ping.exe", "-n", str(count), "-w", "1200", host]
+    return ["ping", "-c", str(count), "-W", "2", host]
+
+
+def _ping(host: str, *, count: int = 4) -> dict[str, Any]:
+    """Mide latencia y tolera la localización del sistema."""
     try:
         completed = subprocess.run(
-            ["ping.exe", "-n", "4", "-w", "1200", host],
+            _ping_command(host, count),
             capture_output=True,
             text=True,
             encoding="oem",
@@ -58,18 +79,23 @@ def _ping(host: str) -> dict[str, Any]:
         }
     output = f"{completed.stdout}\n{completed.stderr}"
     loss_match = re.search(r"\((\d+)%", output)
-    received_match = re.search(r"(?:Received|Recibidos)\s*=\s*(\d+)", output)
-    times = [int(value) for value in re.findall(r"=\s*(\d+)\s*ms", output)]
-    summary_times = times[-3:] if len(times) >= 3 else []
+    received_match = re.search(
+        r"(?:Received|Recibidos)\s*=\s*(\d+)",
+        output,
+        re.IGNORECASE,
+    )
     result: dict[str, Any] = {
         "replies": int(received_match.group(1)) if received_match else None,
         "packetLossPercent": int(loss_match.group(1)) if loss_match else None,
-        "minMs": summary_times[0] if len(summary_times) == 3 else None,
-        "avgMs": summary_times[2] if len(summary_times) == 3 else None,
-        "maxMs": summary_times[1] if len(summary_times) == 3 else None,
     }
-    if completed.returncode != 0 and result["packetLossPercent"] is None:
-        result["error"] = "ping.exe no devolvió un resumen interpretable"
+    for key, pattern in _LABEL_PATTERNS.items():
+        match = pattern.search(output)
+        result[key] = int(match.group(1)) if match else None
+    if all(result.get(key) is None for key in _LABEL_PATTERNS):
+        result["error"] = (
+            "El resumen de ping no expuso etiquetas interpretables "
+            "(Minimum/Máximo/Media); no se deducen valores por posición"
+        )
     return result
 
 
@@ -77,10 +103,12 @@ def build_region_report(api_checks: dict[str, Any] | None = None) -> dict[str, A
     retrieved_at = datetime.now(timezone.utc).isoformat()
     regions = []
     for name, host in REGION_ENDPOINTS:
+        addresses, resolution_error = _resolve_ipv4(host)
         regions.append({
             "region": name,
             "diagnosticHost": host,
-            "resolvedIPv4": _resolve_ipv4(host),
+            "resolvedIPv4": addresses,
+            "resolutionError": resolution_error,
             "localPing": _ping(host),
         })
     return {

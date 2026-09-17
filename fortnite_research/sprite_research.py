@@ -26,7 +26,14 @@ from pathlib import Path
 from typing import Any
 
 from .client import FortniteAPIClient, FortniteAPIError
-from .schedule_assets import _data, _download_image, _image_info, _slug
+from .evidence import sum_bytes
+from .schedule_assets import (
+    _data,
+    _download_image,
+    _image_info,
+    _slug,
+    _validate_reference_image,
+)
 from .transport import atomic_zipfile, write_bytes_atomic, write_text_atomic
 
 
@@ -287,10 +294,15 @@ def _jpeg_dimensions(content: bytes) -> tuple[int | None, int | None]:
     return None, None
 
 
-def _copy_reference_image(source: Path, staging_dir: Path) -> dict[str, Any]:
-    if not source.is_file():
-        raise OSError(f"La imagen de referencia no existe: {source}")
-    content = source.read_bytes()
+def _copy_reference_image(
+    source: Path,
+    staging_dir: Path,
+    content: bytes | None = None,
+) -> dict[str, Any]:
+    if content is None:
+        if not source.is_file():
+            raise OSError(f"La imagen de referencia no existe: {source}")
+        content = source.read_bytes()
     content_type = mimetypes.guess_type(source.name)[0]
     info = _image_info(content, content_type)
     if not info.get("valid"):
@@ -508,11 +520,16 @@ def _build_report(
 def build_sprite_research_package(
     client: FortniteAPIClient,
     output_dir: Path,
-    reference_image: Path | None,
+    reference_image: Path | None = None,
     language: str = "en",
     timeout: float = 30,
 ) -> SpriteResearchArtifacts:
     """Consulta la API, conserva evidencia visual y genera informe + ZIP."""
+    reference_bytes = (
+        _validate_reference_image(reference_image)
+        if reference_image is not None
+        else None
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     retrieved_at = datetime.now(timezone.utc)
     retrieved_iso = retrieved_at.isoformat()
@@ -580,7 +597,11 @@ def build_sprite_research_package(
     try:
         reference_info: dict[str, Any] | None = None
         if reference_image is not None:
-            reference_info = _copy_reference_image(reference_image, staging_dir)
+            reference_info = _copy_reference_image(
+                reference_image,
+                staging_dir,
+                reference_bytes,
+            )
             asset_entries.append(reference_info)
 
         used_urls: set[str] = set()
@@ -642,7 +663,7 @@ def build_sprite_research_package(
             report_path=report_path,
             archive_path=archive_path,
             asset_count=len(successful_assets),
-            asset_bytes=sum(int(item.get("bytes", 0)) for item in successful_assets),
+            asset_bytes=sum_bytes(successful_assets),
             api_probes=tuple(probes),
         )
     finally:
