@@ -19,7 +19,10 @@ class SettingsTests(unittest.TestCase):
             )
             with patch.dict(os.environ, {}, clear=True):
                 settings = Settings.load(root)
-        self.assertEqual(settings.output_dir, root / "reports")
+        # ``Settings.load`` resuelve la raíz del proyecto, y en Windows eso
+        # normaliza los nombres cortos (RUNNER~1 -> runneradmin) del directorio
+        # temporal. Se comparan rutas resueltas para no depender de esa forma.
+        self.assertEqual(settings.output_dir, (root / "reports").resolve())
         self.assertTrue(settings.auto_send_telegram)
         self.assertFalse(settings.telegram_allow_chat_discovery)
 
